@@ -64,10 +64,14 @@ static size_t probe_devdax_align(void)
 {
 	if (devdax_align)
 		return devdax_align;
-	/* Common defaults: 2 MiB on x86; if alignment is 0 we just use 4 KiB
-	 * and let mmap fail loudly so the user knows the device-DAX namespace
-	 * is misconfigured. */
-	devdax_align = 2UL * 1024 * 1024;
+	/*
+	 * The Streaming initramfs creates the namespace with `ndctl
+	 * create-namespace -a 4K` so device-DAX faults at PTE
+	 * granularity.  We mirror that here.  Larger alignments would
+	 * route through the huge fault path which we explicitly bypass
+	 * for Streaming VMAs (VM_FAULT_FALLBACK in dev_dax_huge_fault).
+	 */
+	devdax_align = 4096UL;
 	return devdax_align;
 }
 
@@ -129,6 +133,22 @@ static int test_positive_mmap(void)
 		return -1;
 	}
 	len = probe_devdax_align();
+
+	/*
+	 * Sanity step: a plain MAP_SHARED + PROT_READ mmap on the
+	 * device-DAX fd should always succeed.  If even this fails,
+	 * the device-DAX setup itself is misconfigured and we should
+	 * report that distinctly rather than blame the Streaming gate.
+	 */
+	p = mmap(NULL, len, PROT_READ, MAP_SHARED, fd, 0);
+	if (p == MAP_FAILED) {
+		ksft_print_msg("plain MAP_SHARED on %s also failed: %s — device-DAX setup issue\n",
+			       devdax_path, strerror(errno));
+		close(fd);
+		return 1;
+	}
+	munmap(p, len);
+
 	p = mmap(NULL, len, PROT_READ, MAP_STREAMING | MAP_SHARED, fd, 0);
 	if (p == MAP_FAILED) {
 		if (errno == EOPNOTSUPP) {

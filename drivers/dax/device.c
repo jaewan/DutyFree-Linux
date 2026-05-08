@@ -248,6 +248,16 @@ static vm_fault_t dev_dax_huge_fault(struct vm_fault *vmf, unsigned int order)
 		(vmf->flags & FAULT_FLAG_WRITE) ? "write" : "read",
 		vmf->address & ~((1UL << (order + PAGE_SHIFT)) - 1), order);
 
+	/*
+	 * Streaming VMAs (Directory Tax §4) must fault at PTE
+	 * granularity.  The Streaming PAT slot 6 selector lives at
+	 * _PAGE_PAT (bit 7) — also _PAGE_PSE on PMD entries — so a
+	 * PMD/PUD fault would silently re-route the mapping to PAT
+	 * slot 2 (UC-) and break the H1/H2 hardware contract.
+	 */
+	if (order > 0 && is_streaming_vma(vmf->vma))
+		return VM_FAULT_FALLBACK;
+
 	id = dax_read_lock();
 	if (order == 0)
 		rc = __dev_dax_pte_fault(dev_dax, vmf);
@@ -313,7 +323,17 @@ static int dax_mmap_prepare(struct vm_area_desc *desc)
 		return rc;
 
 	desc->vm_ops = &dax_vm_ops;
-	vma_desc_set_flags(desc, VMA_HUGEPAGE_BIT);
+	/*
+	 * Streaming VMAs (Directory Tax §4) must keep faults at PTE
+	 * granularity.  The slot-6 PAT selector lives at _PAGE_PAT
+	 * (bit 7), which is _PAGE_PSE on PMD entries; allowing a
+	 * PMD/PUD-level fault would silently re-route to PAT slot 2
+	 * (UC-) and break the H1/H2 hardware contract.  THP promotion
+	 * is the per-VMA hint; we keep dev_dax_huge_fault() as the
+	 * authoritative gate (see is_streaming_vma() check there).
+	 */
+	if (!vma_flags_test(&desc->vma_flags, VMA_STREAMING_BIT))
+		vma_desc_set_flags(desc, VMA_HUGEPAGE_BIT);
 	return 0;
 }
 

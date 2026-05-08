@@ -77,10 +77,17 @@ struct streaming_query {
 	pteval_t pte_val;
 	bool present;
 	bool valid;
+	bool huge;
 };
 
+/*
+ * Walk the calling task's page tables for @addr and return the leaf
+ * entry's raw value plus an "is huge" flag.  Device-DAX commonly faults
+ * at PMD or PUD granularity, so we have to stop at whichever level the
+ * leaf actually lives, not just at the PTE level.
+ */
 static int streaming_walk_pte(struct mm_struct *mm, unsigned long addr,
-			      pteval_t *out)
+			      pteval_t *out, bool *is_huge)
 {
 	pgd_t *pgd;
 	p4d_t *p4d;
@@ -89,18 +96,35 @@ static int streaming_walk_pte(struct mm_struct *mm, unsigned long addr,
 	pte_t *ptep;
 	pte_t pte;
 
+	*is_huge = false;
 	pgd = pgd_offset(mm, addr);
-	if (pgd_none(*pgd) || pgd_bad(*pgd))
+	if (pgd_none(*pgd))
 		return -ENOENT;
 	p4d = p4d_offset(pgd, addr);
-	if (p4d_none(*p4d) || p4d_bad(*p4d))
+	if (p4d_none(*p4d))
 		return -ENOENT;
+	if (p4d_leaf(*p4d)) {
+		*out = p4d_val(*p4d);
+		*is_huge = true;
+		return 0;
+	}
 	pud = pud_offset(p4d, addr);
-	if (pud_none(*pud) || pud_bad(*pud))
+	if (pud_none(*pud))
 		return -ENOENT;
+	if (pud_leaf(*pud)) {
+		*out = pud_val(*pud);
+		*is_huge = true;
+		return 0;
+	}
 	pmd = pmd_offset(pud, addr);
-	if (pmd_none(*pmd) || pmd_bad(*pmd))
+	if (pmd_none(*pmd))
 		return -ENOENT;
+	/* PMD leaf: device-DAX 2 MiB or transparent hugepage. */
+	if (pmd_leaf(*pmd)) {
+		*out = pmd_val(*pmd);
+		*is_huge = true;
+		return 0;
+	}
 	ptep = pte_offset_kernel(pmd, addr);
 	if (!ptep)
 		return -ENOENT;
@@ -118,6 +142,7 @@ static ssize_t streaming_query_write(struct file *f, const char __user *ubuf,
 	char buf[32];
 	unsigned long addr;
 	pteval_t v;
+	bool huge = false;
 	int ret;
 
 	if (len == 0 || len >= sizeof(buf))
@@ -129,13 +154,14 @@ static ssize_t streaming_query_write(struct file *f, const char __user *ubuf,
 		return -EINVAL;
 
 	mmap_read_lock(current->mm);
-	ret = streaming_walk_pte(current->mm, addr, &v);
+	ret = streaming_walk_pte(current->mm, addr, &v, &huge);
 	mmap_read_unlock(current->mm);
 
 	spin_lock(&q->lock);
 	q->vaddr = addr;
 	q->pte_val = (ret == 0) ? v : 0;
 	q->present = (ret == 0);
+	q->huge = (ret == 0) ? huge : false;
 	q->valid = true;
 	spin_unlock(&q->lock);
 
@@ -146,15 +172,16 @@ static ssize_t streaming_query_read(struct file *f, char __user *ubuf,
 				    size_t len, loff_t *pos)
 {
 	struct streaming_query *q = f->private_data;
-	char out[96];
+	char out[128];
 	int n;
-	bool valid, present;
+	bool valid, present, huge;
 	unsigned long addr;
-	pteval_t v;
+	pteval_t v, pat_bit;
 
 	spin_lock(&q->lock);
 	valid = q->valid;
 	present = q->present;
+	huge = q->huge;
 	addr = q->vaddr;
 	v = q->pte_val;
 	spin_unlock(&q->lock);
@@ -165,15 +192,24 @@ static ssize_t streaming_query_read(struct file *f, char __user *ubuf,
 	else if (!present)
 		n = scnprintf(out, sizeof(out),
 			      "addr=0x%lx not-present\n", addr);
-	else
+	else {
+		/*
+		 * For huge mappings the PAT bit lives at _PAGE_PAT_LARGE
+		 * (bit 12) instead of _PAGE_PAT (bit 7, which is _PAGE_PSE
+		 * on huge entries).  Report a normalised "pat=" reading so
+		 * the kselftest does not have to special-case page size.
+		 */
+		pat_bit = huge ? _PAGE_PAT_LARGE : _PAGE_PAT;
 		n = scnprintf(out, sizeof(out),
-			      "addr=0x%lx pte=0x%lx softw1=%d pat=%d pcd=%d pwt=%d write=%d\n",
+			      "addr=0x%lx pte=0x%lx softw1=%d pat=%d pcd=%d pwt=%d write=%d huge=%d\n",
 			      addr, (unsigned long)v,
 			      !!(v & _PAGE_SOFTW1),
-			      !!(v & _PAGE_PAT),
+			      !!(v & pat_bit),
 			      !!(v & _PAGE_PCD),
 			      !!(v & _PAGE_PWT),
-			      !!(v & _PAGE_RW));
+			      !!(v & _PAGE_RW),
+			      huge);
+	}
 
 	return simple_read_from_buffer(ubuf, len, pos, out, n);
 }
