@@ -16,6 +16,8 @@
 #include <linux/mm_inline.h>
 #include <linux/shm.h>
 #include <linux/mman.h>
+#include <linux/dax.h>
+#include <linux/streaming.h>
 #include <linux/pagemap.h>
 #include <linux/swap.h>
 #include <linux/syscalls.h>
@@ -401,6 +403,37 @@ unsigned long do_mmap(struct file *file, unsigned long addr,
 	vm_flags |= calc_vm_prot_bits(prot, pkey) | calc_vm_flag_bits(file, flags) |
 			mm->def_flags | VM_MAYREAD | VM_MAYWRITE | VM_MAYEXEC;
 
+	/*
+	 * MAP_STREAMING (Directory Tax §4):
+	 *   - Restrict to device-DAX backed fds.  This anchors the
+	 *     mapping to struct dev_pagemap memory rather than ZONE_NORMAL,
+	 *     so kswapd, AutoNUMA, KSM, and compaction stay structurally
+	 *     out of the way — defense by construction, not by audit.
+	 *   - I1 (read-only): reject PROT_WRITE here; mprotect_fixup()
+	 *     will likewise reject upgrades.
+	 *   - Sharing: MAP_PRIVATE is meaningless for an immutable
+	 *     consumer of producer-published frames.
+	 *   - Hardware: PAT must be enabled; pgprot_streaming() depends
+	 *     on the slot 6 programming done by pat_bp_init().
+	 *   - VMA flags: pin VM_STREAMING with VM_DONTCOPY (so fork()
+	 *     drops the mapping and children must re-mmap and re-validate),
+	 *     VM_PFNMAP (KSM/THP/migration shun the range), and
+	 *     VM_DONTDUMP/VM_DONTEXPAND for a simple lifecycle.
+	 */
+	if (flags & MAP_STREAMING) {
+		if (!streaming_supported())
+			return -EOPNOTSUPP;
+		if (!file || !is_device_dax_file(file))
+			return -EINVAL;
+		if (prot & PROT_WRITE)
+			return -EINVAL;
+		if ((flags & MAP_TYPE) != MAP_SHARED &&
+		    (flags & MAP_TYPE) != MAP_SHARED_VALIDATE)
+			return -EINVAL;
+		vm_flags |= VM_STREAMING | VM_DONTCOPY | VM_DONTDUMP |
+			    VM_DONTEXPAND | VM_PFNMAP;
+	}
+
 	/* Obtain the address to map to. we verify (or select) it and ensure
 	 * that it represents a valid section of the address space.
 	 */
@@ -561,6 +594,22 @@ unsigned long do_mmap(struct file *file, unsigned long addr,
 	    ((vm_flags & VM_LOCKED) ||
 	     (flags & (MAP_POPULATE | MAP_NONBLOCK)) == MAP_POPULATE))
 		*populate = len;
+
+	/*
+	 * Streaming VMA: stamp the per-VMA page protection so every fault,
+	 * set_pte_at(), and mprotect()/change_protection() carries the
+	 * PAT slot 6 + _PAGE_SOFTW1 encoding all the way into the hardware
+	 * fill pipeline.  Done after mmap_region() so we inherit the base
+	 * protection from vm_get_page_prot() and only overwrite cache bits.
+	 * mmap_lock is held for write here.
+	 */
+	if (!IS_ERR_VALUE(addr) && (vm_flags & VM_STREAMING)) {
+		struct vm_area_struct *vma = find_vma(mm, addr);
+
+		if (vma && vma->vm_start == addr)
+			WRITE_ONCE(vma->vm_page_prot,
+				   pgprot_streaming(vma->vm_page_prot));
+	}
 	return addr;
 }
 

@@ -29,6 +29,9 @@
 #define MAP_HUGETLB		0x040000	/* create a huge page mapping */
 #define MAP_SYNC		0x080000 /* perform synchronous page faults for the mapping */
 #define MAP_FIXED_NOREPLACE	0x100000	/* MAP_FIXED which doesn't unmap underlying mapping */
+#define MAP_STREAMING		0x200000	/* read-only, prefetchable, directory-bypass mapping
+						   (Directory Tax §4); requires CONFIG_PAT_STREAMING
+						   and a device-DAX backing fd */
 
 #define MAP_UNINITIALIZED 0x4000000	/* For anonymous mmap, memory could be
 					 * uninitialized */

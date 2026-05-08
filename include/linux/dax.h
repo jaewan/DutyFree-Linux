@@ -49,6 +49,15 @@ struct dax_holder_operations {
 			u64 len, int mf_flags);
 };
 
+#if IS_ENABLED(CONFIG_DEV_DAX)
+bool is_device_dax_file(const struct file *filp);
+#else
+static inline bool is_device_dax_file(const struct file *filp)
+{
+	return false;
+}
+#endif
+
 #if IS_ENABLED(CONFIG_DAX)
 struct dax_device *alloc_dax(void *private, const struct dax_operations *ops);
 void *dax_holder(struct dax_device *dax_dev);

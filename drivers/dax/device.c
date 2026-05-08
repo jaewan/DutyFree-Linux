@@ -390,6 +390,30 @@ static const struct file_operations dax_fops = {
 	.fop_flags = FOP_MMAP_SYNC,
 };
 
+/**
+ * is_device_dax_file() - Is @filp an open device-DAX character device?
+ * @filp: file pointer to test (may be NULL)
+ *
+ * Returns true if @filp is the result of opening a /dev/dax* character
+ * device — i.e. its f_op is &dax_fops, which is set up exclusively by
+ * dev_dax_probe().  Such files are backed by struct dev_pagemap memory
+ * (MEMORY_DEVICE_GENERIC) rather than ZONE_NORMAL, which means they
+ * are structurally exempt from kswapd, AutoNUMA balancing, KSM
+ * de-duplication, and compaction.  The Streaming page-table memory
+ * type (Directory Tax §4) relies on this to keep CXL frames out of
+ * autonomous mm machinery that would silently corrupt distributed
+ * shared state.
+ *
+ * Anonymous fds, pmem-DAX (filesystem-DAX), and regular files all
+ * return false.  Same-binary callers compile out when CONFIG_DAX is
+ * disabled (no device-DAX exists).
+ */
+bool is_device_dax_file(const struct file *filp)
+{
+	return filp && filp->f_op == &dax_fops;
+}
+EXPORT_SYMBOL_GPL(is_device_dax_file);
+
 static void dev_dax_cdev_del(void *cdev)
 {
 	cdev_del(cdev);
