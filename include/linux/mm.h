@@ -388,6 +388,13 @@ enum {
 	DECLARE_VMA_BIT_ALIAS(MAPPED_COPY, ARCH_1),	/* !CONFIG_MMU */
 	DECLARE_VMA_BIT_ALIAS(MTE, HIGH_ARCH_4),	/* arm64 */
 	DECLARE_VMA_BIT_ALIAS(MTE_ALLOWED, HIGH_ARCH_5),/* arm64 */
+	/*
+	 * Streaming page-table memory type for fabric-attached memory
+	 * (Directory Tax §4).  Active on x86_64 with CONFIG_PAT_STREAMING;
+	 * aliases HIGH_ARCH_6 because that bit is unused on x86 (ARM64 GCS
+	 * is the only other consumer and ships in a different binary).
+	 */
+	DECLARE_VMA_BIT_ALIAS(STREAMING, HIGH_ARCH_6),	/* x86_64 (Directory Tax) */
 #ifdef CONFIG_STACK_GROWSUP
 	DECLARE_VMA_BIT_ALIAS(STACK, GROWSUP),
 	DECLARE_VMA_BIT_ALIAS(STACK_EARLY, GROWSDOWN),
@@ -509,6 +516,23 @@ enum {
 #else
 #define VM_DROPPABLE		VM_NONE
 #endif
+
+#ifdef CONFIG_PAT_STREAMING
+#define VM_STREAMING		INIT_VM_FLAG(STREAMING)
+#else
+#define VM_STREAMING		VM_NONE
+#endif
+
+/*
+ * Streaming VMA predicate (Directory Tax §4).  Hot path in zap, fault,
+ * and mprotect — folds to a single bit test in vm_flags, and to
+ * "return false" on builds without CONFIG_PAT_STREAMING because
+ * VM_STREAMING == VM_NONE == 0 there.
+ */
+static inline bool is_streaming_vma(const struct vm_area_struct *vma)
+{
+	return !!(vma->vm_flags & VM_STREAMING);
+}
 
 /* Bits set in the VMA until the stack is in its final location */
 #define VM_STACK_INCOMPLETE_SETUP (VM_RAND_READ | VM_SEQ_READ | VM_STACK_EARLY)
