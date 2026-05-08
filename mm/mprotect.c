@@ -13,6 +13,7 @@
 #include <linux/hugetlb.h>
 #include <linux/shm.h>
 #include <linux/mman.h>
+#include <linux/streaming.h>
 #include <linux/fs.h>
 #include <linux/highmem.h>
 #include <linux/security.h>
@@ -270,6 +271,15 @@ static long change_pte_range(struct mmu_gather *tlb,
 
 			oldpte = modify_prot_start_ptes(vma, addr, pte, nr_ptes);
 			ptent = pte_modify(oldpte, newprot);
+
+			/*
+			 * Streaming intent must survive every protection
+			 * change.  pte_modify() preserves _PAGE_SOFTW1 (alias
+			 * of _PAGE_SPECIAL) and the cache-mode bits via
+			 * _COMMON_PAGE_CHG_MASK + the streaming branch in
+			 * pgprot_modify().  Audit catches a regression.
+			 */
+			streaming_pte_audit(vma, ptent);
 
 			if (uffd_wp)
 				ptent = pte_mkuffd_wp(ptent);

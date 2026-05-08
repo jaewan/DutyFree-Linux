@@ -47,6 +47,7 @@
 #include <linux/sched/task.h>
 #include <linux/hugetlb.h>
 #include <linux/mman.h>
+#include <linux/streaming.h>
 #include <linux/swap.h>
 #include <linux/highmem.h>
 #include <linux/pagemap.h>
@@ -2666,6 +2667,7 @@ static vm_fault_t insert_pfn(struct vm_area_struct *vma, unsigned long addr,
 		entry = maybe_mkwrite(pte_mkdirty(entry), vma);
 	}
 
+	streaming_pte_audit(vma, entry);
 	set_pte_at(mm, addr, pte, entry);
 	update_mmu_cache(vma, addr, pte); /* XXX: why not for insert_page? */
 

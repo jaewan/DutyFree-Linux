@@ -15,11 +15,13 @@
 #define _LINUX_STREAMING_H
 
 #include <linux/types.h>
+#include <linux/mm_types.h>
 
 struct vm_area_struct;
 
 #ifdef CONFIG_PAT_STREAMING
 #include <asm/memtype.h>		/* pat_enabled() */
+#include <asm/pgtable_types.h>
 
 /**
  * streaming_supported() - is MAP_STREAMING usable on this kernel?
@@ -33,11 +35,20 @@ static inline bool streaming_supported(void)
 {
 	return pat_enabled();
 }
-#else
+
+void streaming_pte_audit(struct vm_area_struct *vma, pte_t pte);
+
+#else /* !CONFIG_PAT_STREAMING */
+
 static inline bool streaming_supported(void)
 {
 	return false;
 }
+
+static inline void streaming_pte_audit(struct vm_area_struct *vma, pte_t pte)
+{
+}
+
 #endif /* CONFIG_PAT_STREAMING */
 
 #endif /* _LINUX_STREAMING_H */

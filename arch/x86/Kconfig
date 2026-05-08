@@ -1757,6 +1757,31 @@ config X86_PAT
 
 	  If unsure, say Y.
 
+config PAT_STREAMING
+	bool "Streaming PAT memory type prototype (Directory Tax §4)"
+	depends on X86_64 && X86_PAT && DEV_DAX
+	default n
+	help
+	  Reserve PAT slot 6 plus _PAGE_SOFTW1 as the OS-side intent
+	  marker for the Streaming page-table memory type proposed in
+	  the Directory Tax paper: a read-only, prefetchable,
+	  directory-bypassable mapping for fabric-attached (CXL) memory.
+
+	  Enabling this option exposes the MAP_STREAMING mmap flag and
+	  the /sys/kernel/debug/streaming/ debugfs surface used by the
+	  kselftest suite to verify intent propagation.  MAP_STREAMING
+	  is restricted to device-DAX (struct dev_pagemap) backings so
+	  kswapd, AutoNUMA, KSM, and compaction stay structurally out
+	  of the way.
+
+	  On current silicon the slot behaves as plain WB; the
+	  directory-bypass fill path (H1/H2 from the paper) is exercised
+	  through gem5 with a companion patch.  This is a research
+	  prototype and is not yet covered by KVM EPT propagation,
+	  socket-keyed I0 enforcement, or the two-phase teardown drain.
+
+	  If unsure, say N.
+
 config X86_UMIP
 	def_bool y
 	prompt "User Mode Instruction Prevention" if EXPERT

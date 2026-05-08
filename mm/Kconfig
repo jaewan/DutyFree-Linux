@@ -1471,6 +1471,19 @@ config LAZY_MMU_MODE_KUNIT_TEST
 
 	  If unsure, say N.
 
+config PAT_STREAMING_KUNIT_TEST
+	tristate "KUnit tests for the Streaming page-table memory type" if !KUNIT_ALL_TESTS
+	depends on PAT_STREAMING
+	depends on KUNIT
+	default KUNIT_ALL_TESTS
+	help
+	  Verify that the OS-side Streaming intent pipeline (Directory
+	  Tax §4) is internally consistent: PAT MSR programming, cache-mode
+	  round-trip, pgprot_streaming() bit pattern, and
+	  _COMMON_PAGE_CHG_MASK preservation across pte_modify().
+
+	  If unsure, say N.
+
 source "mm/damon/Kconfig"
 
 endmenu
