@@ -706,6 +706,30 @@ mprotect_fixup(struct vma_iterator *vmi, struct mmu_gather *tlb,
 	if (vma_is_sealed(vma))
 		return -EPERM;
 
+	/*
+	 * Streaming VMA (Directory Tax §4 / I1): the OS guarantees the
+	 * mapping never gains write capability and never loses the
+	 * structural flags that keep it out of fork-time COW and
+	 * mm-machinery (KSM/THP/migration).  Stripping VM_PFNMAP would
+	 * silently re-enroll the range; stripping VM_DONTCOPY would
+	 * leak an unvalidated mapping into a fork; stripping
+	 * VM_STREAMING would lose the marker entirely.  All of these
+	 * are I1 violations and are rejected before any state mutation.
+	 *
+	 * pgprot_modify() preserves the cache bits and _PAGE_SOFTW1 via
+	 * _COMMON_PAGE_CHG_MASK + the streaming branch added in commit 1,
+	 * so PTE-side preservation is automatic on the change_protection
+	 * path.
+	 */
+	if (is_streaming_vma(vma)) {
+		if (newflags & VM_WRITE)
+			return -EACCES;
+		if (!(newflags & VM_DONTCOPY) || !(newflags & VM_PFNMAP))
+			return -EACCES;
+		if (!(newflags & VM_STREAMING))
+			return -EACCES;
+	}
+
 	if (newflags == oldflags) {
 		*pprev = vma;
 		return 0;
