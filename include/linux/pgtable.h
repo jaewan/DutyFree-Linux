@@ -1689,6 +1689,17 @@ void arch_sync_kernel_mappings(unsigned long start, unsigned long end);
 #define pgprot_device pgprot_noncached
 #endif
 
+/*
+ * Streaming page-table memory type (Directory Tax §4): read-only,
+ * prefetchable, directory-bypassable.  Architectures that do not
+ * implement Streaming map this to the identity, which yields plain
+ * WB on x86 and the architectural default elsewhere.  Such kernels
+ * already reject MAP_STREAMING with EOPNOTSUPP in do_mmap().
+ */
+#ifndef pgprot_streaming
+#define pgprot_streaming(prot)	(prot)
+#endif
+
 #ifndef pgprot_mhp
 #define pgprot_mhp(prot)	(prot)
 #endif
@@ -1704,6 +1715,15 @@ static inline pgprot_t pgprot_modify(pgprot_t oldprot, pgprot_t newprot)
 		newprot = pgprot_writecombine(newprot);
 	if (pgprot_val(oldprot) == pgprot_val(pgprot_device(oldprot)))
 		newprot = pgprot_device(newprot);
+	/*
+	 * Streaming page-table memory type (Directory Tax §4): once a VMA
+	 * has been stamped with the Streaming pgprot, mprotect()-driven
+	 * protection changes must preserve the cache-mode bits *and* the
+	 * software intent marker.  On architectures without a real
+	 * Streaming type the identity stub makes this branch a no-op.
+	 */
+	if (pgprot_val(oldprot) == pgprot_val(pgprot_streaming(oldprot)))
+		newprot = pgprot_streaming(newprot);
 	return newprot;
 }
 #endif

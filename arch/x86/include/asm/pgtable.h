@@ -15,6 +15,21 @@
 		     cachemode2protval(_PAGE_CACHE_MODE_UC_MINUS)))	\
 	 : (prot))
 
+/*
+ * Macro to mark a page protection value as Streaming (Directory Tax §4):
+ * read-only, prefetchable, directory-bypassable on Streaming-aware
+ * microarchitectures.  Selects PAT slot 6 (PAT=1, PCD=1, PWT=0) and
+ * sets _PAGE_SOFTW1 as the software intent marker that survives
+ * pte_modify() via _COMMON_PAGE_CHG_MASK (which already includes
+ * _PAGE_SPECIAL, the alias of bit 9).  Both bits together form the
+ * page-walker contract gem5 (and any future Streaming silicon)
+ * pattern-matches on.
+ */
+#define pgprot_streaming(prot)						\
+	__pgprot((pgprot_val(prot) & ~_PAGE_CACHE_MASK) |		\
+		 cachemode2protval(_PAGE_CACHE_MODE_STREAMING) |	\
+		 _PAGE_SOFTW1)
+
 #ifndef __ASSEMBLER__
 #include <linux/spinlock.h>
 #include <asm/x86_init.h>

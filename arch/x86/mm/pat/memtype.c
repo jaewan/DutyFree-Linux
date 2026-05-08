@@ -207,6 +207,16 @@ static enum page_cache_mode __init pat_get_cache_mode(unsigned int pat_val,
  * Update the cache mode to pgprot translation tables according to PAT
  * configuration.
  * Using lower indices is preferred, so we start with highest index.
+ *
+ * Slot 6 is treated specially: pat_bp_init() programs it as WB
+ * underneath, but its raison d'être is the Streaming page-table memory
+ * type (Directory Tax §4).  A consumer of slot 6 is by definition a
+ * Streaming mapping; the cache mode visible to the rest of the kernel
+ * is therefore _PAGE_CACHE_MODE_STREAMING, even though the raw MSR
+ * byte reads back as WB.  Lower-indexed slots that hold the regular
+ * WB encoding still claim _PAGE_CACHE_MODE_WB on subsequent loop
+ * iterations, so __cachemode2pte_tbl[WB] resolves to slot 0 (the all-
+ * zeros encoding) as required by the architecture.
  */
 static void __init init_cache_modes(u64 pat)
 {
@@ -218,6 +228,10 @@ static void __init init_cache_modes(u64 pat)
 	for (i = 7; i >= 0; i--) {
 		cache = pat_get_cache_mode((pat >> (i * 8)) & 7,
 					   pat_msg + 4 * i);
+		if (i == 6 && cache == _PAGE_CACHE_MODE_WB) {
+			cache = _PAGE_CACHE_MODE_STREAMING;
+			memcpy(pat_msg + 4 * i, "ST  ", 4);
+		}
 		update_cache_mode_entry(i, cache);
 	}
 	pr_info("x86/PAT: Configuration [0-7]: %s\n", pat_msg);
@@ -342,7 +356,7 @@ void __init pat_bp_init(void)
 		 * The reserved slots are unused, but mapped to their
 		 * corresponding types in the presence of PAT errata.
 		 */
-		pat_msr_val = PAT_VALUE(WB, WC, UC_MINUS, UC, WB, WP, UC_MINUS, WT);
+		pat_msr_val = PAT_VALUE(WB, WC, UC_MINUS, UC, WB, WP, WB, WT);
 	}
 
 	memory_caching_control |= CACHE_PAT;

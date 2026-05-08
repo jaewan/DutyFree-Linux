@@ -171,6 +171,19 @@ enum page_cache_mode {
 	_PAGE_CACHE_MODE_UC       = 3,
 	_PAGE_CACHE_MODE_WT       = 4,
 	_PAGE_CACHE_MODE_WP       = 5,
+	/*
+	 * Streaming: read-only, prefetchable, directory-bypassable
+	 * page-table memory type for fabric-attached memory (Directory
+	 * Tax §4).  On current silicon Streaming behaves like WB; on a
+	 * Streaming-aware microarchitecture (e.g. simulated in gem5) the
+	 * same PTE encoding (PAT=1, PCD=1, PWT=0, slot 6) selects the
+	 * directory-bypass fill path.  The OS additionally tags every
+	 * Streaming PTE with _PAGE_SOFTW1 as a software-side intent
+	 * marker; that bit is shared with _PAGE_SPECIAL, which is fine
+	 * because Streaming VMAs are always VM_PFNMAP and therefore
+	 * carry SPECIAL on the very same bit by construction.
+	 */
+	_PAGE_CACHE_MODE_STREAMING = 6,
 
 	_PAGE_CACHE_MODE_NUM      = 8
 };

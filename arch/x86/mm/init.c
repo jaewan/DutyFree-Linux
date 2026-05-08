@@ -59,6 +59,13 @@ static uint16_t __cachemode2pte_tbl[_PAGE_CACHE_MODE_NUM] = {
 	[_PAGE_CACHE_MODE_UC      ]	= _PAGE_PWT | _PAGE_PCD,
 	[_PAGE_CACHE_MODE_WT      ]	= 0         | _PAGE_PCD,
 	[_PAGE_CACHE_MODE_WP      ]	= 0         | _PAGE_PCD,
+	/*
+	 * Streaming: PAT slot 6 = (PAT=1, PCD=1, PWT=0).  Defaults to
+	 * UC- before pat_bp_init() runs.  Once pat_bp_init() programs
+	 * slot 6 as WB, init_cache_modes() rewrites this row to the same
+	 * (PCD|PAT) PTE bits via update_cache_mode_entry().
+	 */
+	[_PAGE_CACHE_MODE_STREAMING] =     _PAGE_PCD | _PAGE_PAT,
 };
 
 unsigned long cachemode2protval(enum page_cache_mode pcm)
