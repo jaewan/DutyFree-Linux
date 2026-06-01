@@ -302,7 +302,16 @@ pgtable_split_needed(struct vm_area_struct *vma, unsigned long cp_flags)
 	 * we need to split.  We cannot wr-protect shmem thp because file
 	 * thp is handled differently when split by erasing the pmd so far.
 	 */
-	return (cp_flags & MM_CP_UFFD_WP) && !vma_is_anonymous(vma);
+	if ((cp_flags & MM_CP_UFFD_WP) && !vma_is_anonymous(vma))
+		return true;
+	/*
+	 * Streaming transitions rewrite cache-mode bits at PTE
+	 * granularity, so any huge PMD in the range must be split
+	 * before the post-pass walker runs.
+	 */
+	if (cp_flags & MM_CP_STREAMING_ALL)
+		return true;
+	return false;
 }
 
 /*
@@ -581,6 +590,11 @@ mprotect_fixup(struct vma_iterator *vmi, struct mmu_gather *tlb,
 	struct mm_struct *mm = vma->vm_mm;
 	unsigned long oldflags = vma->vm_flags;
 	long nrpages = (end - start) >> PAGE_SHIFT;
+	bool was_streaming = is_streaming_vma(vma);
+	bool will_stream = IS_ENABLED(CONFIG_PAT_STREAMING) &&
+			   (newflags & VM_STREAMING);
+	bool entering_streaming = !was_streaming && will_stream;
+	bool leaving_streaming  =  was_streaming && !will_stream;
 	unsigned int mm_cp_flags = 0;
 	unsigned long charged = 0;
 	int error;
@@ -588,6 +602,12 @@ mprotect_fixup(struct vma_iterator *vmi, struct mmu_gather *tlb,
 	if (newflags == oldflags) {
 		*pprev = vma;
 		return 0;
+	}
+
+	if (entering_streaming) {
+		error = streaming_validate_entry(vma);
+		if (error)
+			return error;
 	}
 
 	/*
@@ -646,11 +666,35 @@ mprotect_fixup(struct vma_iterator *vmi, struct mmu_gather *tlb,
 	 */
 	vma_start_write(vma);
 	vm_flags_reset(vma, newflags);
-	if (vma_wants_manual_pte_write_upgrade(vma))
+	/*
+	 * Streaming pages must stay strictly read-only for the lifetime
+	 * of the mode; suppress the writable-upgrade heuristic that
+	 * change_protection() would otherwise apply to already-dirty
+	 * PTEs.
+	 */
+	if (!will_stream && vma_wants_manual_pte_write_upgrade(vma))
 		mm_cp_flags |= MM_CP_TRY_CHANGE_WRITABLE;
+	if (entering_streaming)
+		mm_cp_flags |= MM_CP_STREAMING_ENTER;
+	else if (leaving_streaming)
+		mm_cp_flags |= MM_CP_STREAMING_LEAVE;
 	vma_set_page_prot(vma);
 
 	change_protection(tlb, vma, start, end, mm_cp_flags);
+
+	/*
+	 * Cache-mode bits sit in _PAGE_CHG_MASK, so change_protection
+	 * preserves the OLD encoding through pte_modify(). Rewrite them
+	 * to the new target now that THPs have been split and R/W/Exec
+	 * is in place. The walker also flushes the TLB across the range
+	 * to make the new cache mode visible system-wide.
+	 */
+	if (entering_streaming || leaving_streaming) {
+		error = streaming_apply_cache_bits(vma, start, end,
+						   entering_streaming);
+		if (error)
+			goto fail;
+	}
 
 	if ((oldflags & VM_ACCOUNT) && !(newflags & VM_ACCOUNT))
 		vm_unacct_memory(nrpages);
@@ -686,6 +730,7 @@ static int do_mprotect_pkey(unsigned long start, size_t len,
 	const int grows = prot & (PROT_GROWSDOWN|PROT_GROWSUP);
 	const bool rier = (current->personality & READ_IMPLIES_EXEC) &&
 				(prot & PROT_READ);
+	bool streaming_writeback_needed = false;
 	struct mmu_gather tlb;
 	struct vma_iterator vmi;
 
@@ -693,6 +738,15 @@ static int do_mprotect_pkey(unsigned long start, size_t len,
 
 	prot &= ~(PROT_GROWSDOWN|PROT_GROWSUP);
 	if (grows == (PROT_GROWSDOWN|PROT_GROWSUP)) /* can't be both */
+		return -EINVAL;
+
+	/*
+	 * PROT_STREAMING must remain read-only for the lifetime of the
+	 * region; combining it with PROT_WRITE in a single mprotect call
+	 * is a usage error.
+	 */
+	if (IS_ENABLED(CONFIG_PAT_STREAMING) &&
+	    (prot & PROT_STREAMING) && (prot & PROT_WRITE))
 		return -EINVAL;
 
 	if (start & ~PAGE_MASK)
@@ -806,6 +860,11 @@ static int do_mprotect_pkey(unsigned long start, size_t len,
 				break;
 		}
 
+		if (IS_ENABLED(CONFIG_PAT_STREAMING) &&
+		    !(vma->vm_flags & VM_STREAMING) &&
+		    (newflags & VM_STREAMING))
+			streaming_writeback_needed = true;
+
 		error = mprotect_fixup(&vmi, &tlb, vma, &prev, nstart, tmp, newflags);
 		if (error)
 			break;
@@ -815,6 +874,16 @@ static int do_mprotect_pkey(unsigned long start, size_t len,
 		prot = reqprot;
 	}
 	tlb_finish_mmu(&tlb);
+
+	/*
+	 * Push every dirty cache line on every CPU back to RAM so the
+	 * memory image of the now-Streaming region is self-consistent
+	 * before the new semantics become observable. The TLB has
+	 * already been invalidated above; no further dirties can be
+	 * queued through the old WB mapping.
+	 */
+	if (streaming_writeback_needed && !error)
+		streaming_writeback_all();
 
 	if (!error && tmp < end)
 		error = -ENOMEM;

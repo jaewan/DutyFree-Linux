@@ -97,6 +97,13 @@ void vma_set_page_prot(struct vm_area_struct *vma)
 		vm_flags &= ~VM_SHARED;
 		vm_page_prot = vm_pgprot_modify(vm_page_prot, vm_flags);
 	}
+	/*
+	 * Streaming VMAs must always carry the PAT slot-6 cache encoding so
+	 * that newly faulted (or swap-/COW-restored) pages get the right
+	 * cache mode without any extra plumbing in the fault path.
+	 */
+	if (is_streaming_vma(vma))
+		vm_page_prot = pgprot_streaming(vm_page_prot);
 	/* remove_protection_ptes reads vma->vm_page_prot without mmap_lock */
 	WRITE_ONCE(vma->vm_page_prot, vm_page_prot);
 }

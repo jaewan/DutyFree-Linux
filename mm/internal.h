@@ -594,6 +594,27 @@ static inline bool is_streaming_vma(const struct vm_area_struct *vma)
 		(vma->vm_flags & VM_STREAMING);
 }
 
+#ifdef CONFIG_PAT_STREAMING
+int streaming_validate_entry(struct vm_area_struct *vma);
+int streaming_apply_cache_bits(struct vm_area_struct *vma,
+			       unsigned long start, unsigned long end,
+			       bool to_streaming);
+void streaming_writeback_all(void);
+#else
+static inline int streaming_validate_entry(struct vm_area_struct *vma)
+{
+	return -EOPNOTSUPP;
+}
+static inline int streaming_apply_cache_bits(struct vm_area_struct *vma,
+					     unsigned long start,
+					     unsigned long end,
+					     bool to_streaming)
+{
+	return -EOPNOTSUPP;
+}
+static inline void streaming_writeback_all(void) { }
+#endif
+
 /* mm/util.c */
 struct anon_vma *folio_anon_vma(struct folio *folio);
 

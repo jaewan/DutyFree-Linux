@@ -369,6 +369,13 @@ extern unsigned int kobjsize(const void *objp);
 
 #if defined(CONFIG_X86)
 # define VM_PAT		VM_ARCH_1	/* PAT reserves whole VMA at once (x86) */
+# ifdef CONFIG_PAT_STREAMING
+/*
+ * Make mprotect() drop VM_STREAMING when the caller does not pass
+ * PROT_STREAMING again, so a plain RW mprotect can leave Streaming.
+ */
+#  define VM_ARCH_CLEAR	VM_STREAMING
+# endif
 #elif defined(CONFIG_PPC)
 # define VM_SAO		VM_ARCH_1	/* Strong Access Ordering (powerpc) */
 #elif defined(CONFIG_PARISC)
@@ -2539,6 +2546,11 @@ extern unsigned long move_page_tables(struct vm_area_struct *vma,
 #define  MM_CP_UFFD_WP_RESOLVE             (1UL << 3) /* Resolve wp */
 #define  MM_CP_UFFD_WP_ALL                 (MM_CP_UFFD_WP | \
 					    MM_CP_UFFD_WP_RESOLVE)
+/* Whether this change is entering / leaving the Streaming PAT mode */
+#define  MM_CP_STREAMING_ENTER             (1UL << 4)
+#define  MM_CP_STREAMING_LEAVE             (1UL << 5)
+#define  MM_CP_STREAMING_ALL               (MM_CP_STREAMING_ENTER | \
+					    MM_CP_STREAMING_LEAVE)
 
 bool vma_needs_dirty_tracking(struct vm_area_struct *vma);
 int vma_wants_writenotify(struct vm_area_struct *vma, pgprot_t vm_page_prot);

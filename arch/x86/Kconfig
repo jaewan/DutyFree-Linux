@@ -1816,6 +1816,35 @@ config ARCH_USES_PG_UNCACHED
 	def_bool y
 	depends on X86_PAT
 
+config PAT_STREAMING
+	bool "PAT slot 6 Streaming memory type (Directory Tax §4 prototype)"
+	depends on X86_64 && X86_PAT
+	default n
+	help
+	  Reserves x86 PAT slot 6 as a software-defined "Streaming" memory
+	  type and adds a reversible mprotect(PROT_STREAMING) entry point
+	  that toggles a region between regular write-back and Streaming.
+
+	  On baremetal silicon slot 6 is encoded as WB so the toggle is a
+	  no-op cache-mode-wise; the marker exists so gem5 or another
+	  simulator can attach directory-bypass / silent-clean-discard
+	  semantics to the slot (the H2 hardware obligation from
+	  *The Directory Tax* §4 contract).
+
+	  Entering Streaming write-protects the range, rewrites the PAT
+	  bits, and issues WBNOINVD across all CPUs to push any residual
+	  dirty data to RAM. Leaving Streaming restores plain WB and
+	  applies whatever permissions the user passes to mprotect.
+
+	  Prototype scope: anonymous and private file-backed VMAs only;
+	  PFNMAP, MIXEDMAP, VM_PAT, shared-writable-file, userfaultfd-WP,
+	  and Xen PV mappings are rejected. Pages with swap entries in
+	  the range are also rejected, because Streaming pages must not
+	  be reclaimed under this prototype. See
+	  Documentation/x86/pat-streaming.rst.
+
+	  If unsure, say N.
+
 config X86_UMIP
 	def_bool y
 	prompt "User Mode Instruction Prevention" if EXPERT
