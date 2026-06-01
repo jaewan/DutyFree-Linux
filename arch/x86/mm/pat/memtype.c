@@ -222,8 +222,23 @@ static void __init init_cache_modes(u64 pat)
 
 	pat_msg[32] = 0;
 	for (i = 7; i >= 0; i--) {
-		cache = pat_get_cache_mode((pat >> (i * 8)) & 7,
-					   pat_msg + 4 * i);
+		unsigned int pat_val = (pat >> (i * 8)) & 7;
+
+		cache = pat_get_cache_mode(pat_val, pat_msg + 4 * i);
+		/*
+		 * PAT slot 6 is repurposed as the Streaming memory type
+		 * (Directory Tax §4). Its MSR encoding is WB so it behaves
+		 * identically on baremetal, but in software we tag the
+		 * reverse-translation table (PCD|PAT bit pattern) as
+		 * STREAMING so that pgprot2cachemode() can distinguish a
+		 * Streaming PTE from a plain WB PTE. The forward
+		 * translation for WB is reinstated by the i==0 iteration
+		 * below, keeping __cachemode2pte_tbl[WB] = 0.
+		 */
+		if (i == 6 && pat_val == PAT_WB) {
+			cache = _PAGE_CACHE_MODE_STREAMING;
+			memcpy(pat_msg + 4 * i, "ST  ", 4);
+		}
 		update_cache_mode_entry(i, cache);
 	}
 	pr_info("x86/PAT: Configuration [0-7]: %s\n", pat_msg);
@@ -352,13 +367,19 @@ void __init pat_bp_init(void)
 		 *      011    3    UC : _PAGE_CACHE_MODE_UC
 		 *      100    4    WB : Reserved
 		 *      101    5    WP : _PAGE_CACHE_MODE_WP
-		 *      110    6    UC-: Reserved
+		 *      110    6    WB : _PAGE_CACHE_MODE_STREAMING (Directory Tax §4)
 		 *      111    7    WT : _PAGE_CACHE_MODE_WT
+		 *
+		 * Slot 6 is repurposed from UC- (reserved) to a WB-equivalent
+		 * encoding used as the "Streaming" memory type marker: identical
+		 * to WB on baremetal silicon, distinguishable to gem5/simulator
+		 * page walkers as a directory-bypass / silent-clean-discard hint
+		 * (the H2 hardware obligation in the Directory Tax §4 contract).
 		 *
 		 * The reserved slots are unused, but mapped to their
 		 * corresponding types in the presence of PAT errata.
 		 */
-		pat_msr_val = PAT(WB, WC, UC_MINUS, UC, WB, WP, UC_MINUS, WT);
+		pat_msr_val = PAT(WB, WC, UC_MINUS, UC, WB, WP, WB, WT);
 	}
 
 	memory_caching_control |= CACHE_PAT;

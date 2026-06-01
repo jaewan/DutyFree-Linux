@@ -15,6 +15,16 @@
 		     cachemode2protval(_PAGE_CACHE_MODE_UC_MINUS)))	\
 	 : (prot))
 
+/*
+ * Macro to mark a page protection value as Streaming (PAT slot 6).
+ * Clears existing cache bits then sets the Streaming encoding
+ * (PAT=1, PCD=1, PWT=0). Behaves as WB on baremetal; gem5/simulator
+ * page walkers may interpret slot 6 as a directory-bypass hint.
+ */
+#define pgprot_streaming(prot)						\
+	__pgprot((pgprot_val(prot) & ~_PAGE_CACHE_MASK) |		\
+		 cachemode2protval(_PAGE_CACHE_MODE_STREAMING))
+
 #ifndef __ASSEMBLY__
 #include <linux/spinlock.h>
 #include <asm/x86_init.h>

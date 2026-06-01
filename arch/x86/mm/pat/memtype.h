@@ -24,6 +24,7 @@ static inline char *cattr_name(enum page_cache_mode pcm)
 	case _PAGE_CACHE_MODE_WC:		return "write-combining";
 	case _PAGE_CACHE_MODE_WT:		return "write-through";
 	case _PAGE_CACHE_MODE_WP:		return "write-protected";
+	case _PAGE_CACHE_MODE_STREAMING:	return "streaming";
 	default:				return "broken";
 	}
 }
