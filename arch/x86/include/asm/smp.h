@@ -120,6 +120,7 @@ void native_play_dead(void);
 void play_dead_common(void);
 void wbinvd_on_cpu(int cpu);
 int wbinvd_on_all_cpus(void);
+void wbnoinvd_on_all_cpus(void);
 
 void smp_kick_mwait_play_dead(void);
 
@@ -166,6 +167,10 @@ static inline int wbinvd_on_all_cpus(void)
 {
 	wbinvd();
 	return 0;
+}
+static inline void wbnoinvd_on_all_cpus(void)
+{
+	wbnoinvd();
 }
 
 static inline struct cpumask *cpu_llc_shared_mask(int cpu)

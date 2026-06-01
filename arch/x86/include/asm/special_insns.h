@@ -120,6 +120,22 @@ static __always_inline void native_wbinvd(void)
 	asm volatile("wbinvd": : :"memory");
 }
 
+/*
+ * WBNOINVD writes back all dirty cache lines without invalidating
+ * them - the same memory-coherence effect as WBINVD but the cache
+ * is preserved, avoiding the cold-cache penalty on the caller.
+ *
+ * Opcode F3 0F 09 (WBINVD prefixed with F3). Enumerated by
+ * CPUID Fn8000_0008_EBX[9] -> X86_FEATURE_WBNOINVD.
+ *
+ * Encoded as raw bytes so we don't require a binutils that knows
+ * the mnemonic.
+ */
+static __always_inline void native_wbnoinvd(void)
+{
+	asm volatile(".byte 0xf3, 0x0f, 0x09" ::: "memory");
+}
+
 static inline unsigned long __read_cr4(void)
 {
 	return native_read_cr4();
@@ -174,6 +190,22 @@ static __always_inline void wbinvd(void)
 }
 
 #endif /* CONFIG_PARAVIRT_XXL */
+
+/*
+ * Writes back all dirty lines to memory without invalidating the cache.
+ * Falls back to WBINVD (writeback + invalidate) on CPUs that lack the
+ * WBNOINVD extension - the memory-coherence guarantee is identical;
+ * only the cache-preservation property is lost. The alternative-patch
+ * machinery rewrites the WBINVD into WBNOINVD at boot on supporting
+ * silicon.
+ */
+static __always_inline void wbnoinvd(void)
+{
+	asm volatile(ALTERNATIVE("wbinvd",
+				 ".byte 0xf3, 0x0f, 0x09",
+				 X86_FEATURE_WBNOINVD)
+		     ::: "memory");
+}
 
 static __always_inline void clflush(volatile void *__p)
 {

@@ -20,3 +20,20 @@ int wbinvd_on_all_cpus(void)
 	return 0;
 }
 EXPORT_SYMBOL(wbinvd_on_all_cpus);
+
+static void __wbnoinvd(void *dummy)
+{
+	wbnoinvd();
+}
+
+/*
+ * Broadcast a writeback-without-invalidate to every online CPU.
+ * Used to push dirty cache lines to memory across the system without
+ * paying the cold-cache cost of WBINVD (the wbnoinvd() helper itself
+ * falls back to WBINVD on CPUs that lack the WBNOINVD extension).
+ */
+void wbnoinvd_on_all_cpus(void)
+{
+	on_each_cpu(__wbnoinvd, NULL, 1);
+}
+EXPORT_SYMBOL_GPL(wbnoinvd_on_all_cpus);
