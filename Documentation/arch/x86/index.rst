@@ -21,6 +21,7 @@ x86-specific Documentation
    tlb
    mtrr
    pat
+   pat-streaming
    intel-hfi
    shstk
    iommu

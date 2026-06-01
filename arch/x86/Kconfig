@@ -1845,6 +1845,19 @@ config PAT_STREAMING
 
 	  If unsure, say N.
 
+config PAT_STREAMING_KUNIT_TEST
+	tristate "KUnit tests for PAT Streaming" if !KUNIT_ALL_TESTS
+	depends on PAT_STREAMING && KUNIT
+	default KUNIT_ALL_TESTS
+	help
+	  Builds in-kernel tests for PAT slot 6 layout, the cache-mode
+	  translation tables, pgprot_streaming() bit pattern, the
+	  VM_STREAMING flag and arch_calc_vm_prot_bits / arch_validate_prot
+	  hooks. End-to-end mprotect behaviour is exercised by the
+	  matching kselftest under tools/testing/selftests/mm/streaming.
+
+	  If unsure, say N.
+
 config X86_UMIP
 	def_bool y
 	prompt "User Mode Instruction Prevention" if EXPERT
