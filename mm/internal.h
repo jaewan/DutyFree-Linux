@@ -583,6 +583,17 @@ static inline bool is_data_mapping(vm_flags_t flags)
 	return (flags & (VM_WRITE | VM_SHARED | VM_STACK)) == VM_WRITE;
 }
 
+/*
+ * True iff the VMA is currently flagged as Streaming (PAT slot 6).
+ * Folds to a constant false on builds without CONFIG_PAT_STREAMING
+ * because VM_STREAMING aliases VM_NONE in that case.
+ */
+static inline bool is_streaming_vma(const struct vm_area_struct *vma)
+{
+	return IS_ENABLED(CONFIG_PAT_STREAMING) &&
+		(vma->vm_flags & VM_STREAMING);
+}
+
 /* mm/util.c */
 struct anon_vma *folio_anon_vma(struct folio *folio);
 

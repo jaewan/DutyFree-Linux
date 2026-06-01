@@ -356,6 +356,17 @@ extern unsigned int kobjsize(const void *objp);
 # define VM_SHADOW_STACK	VM_NONE
 #endif
 
+#ifdef CONFIG_PAT_STREAMING
+/*
+ * Marks a VMA whose pages are currently mapped with the Streaming
+ * memory type (PAT slot 6). Toggled by mprotect(PROT_STREAMING) on
+ * x86_64; see Documentation/x86/pat-streaming.rst.
+ */
+# define VM_STREAMING	VM_HIGH_ARCH_4
+#else
+# define VM_STREAMING	VM_NONE
+#endif
+
 #if defined(CONFIG_X86)
 # define VM_PAT		VM_ARCH_1	/* PAT reserves whole VMA at once (x86) */
 #elif defined(CONFIG_PPC)
