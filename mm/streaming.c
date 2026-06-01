@@ -13,8 +13,14 @@
 #define pr_fmt(fmt)	"PAT-Streaming: " fmt
 
 #include <linux/mm.h>
+#include <linux/debugfs.h>
 #include <linux/hugetlb.h>
+#include <linux/init.h>
+#include <linux/mutex.h>
 #include <linux/pagewalk.h>
+#include <linux/sched/mm.h>
+#include <linux/seq_file.h>
+#include <linux/uaccess.h>
 #include <linux/userfaultfd_k.h>
 
 #include <xen/xen.h>
@@ -162,3 +168,161 @@ void streaming_writeback_all(void)
 {
 	wbnoinvd_on_all_cpus();
 }
+
+/*
+ * --------------------------------------------------------------------
+ * Prototype debugfs interface: /sys/kernel/debug/streaming/pte_query
+ *
+ * Selftests need to observe the raw PTE value at a given virtual
+ * address to confirm that PROT_STREAMING actually installs the
+ * expected slot-6 cache encoding. /proc/PID/pagemap exposes the PFN
+ * but not the PTE attribute bits, so we add a tiny debugfs entry
+ * here. The interface is intentionally prototype-only - the long
+ * term plan is to surface streaming state via /proc/PID/smaps.
+ *
+ * Protocol:
+ *   - Write a hex virtual address (e.g. "7fff5e4c1000") to the file.
+ *   - Read back a single line "<vaddr_hex> <pte_hex>\n" with the raw
+ *     PTE value as observed by the caller's own mm.
+ *
+ * Only the writer's own address space is inspected; there is no path
+ * to read another task's PTEs.
+ * --------------------------------------------------------------------
+ */
+#ifdef CONFIG_DEBUG_FS
+
+struct streaming_debug_state {
+	struct mutex lock;
+	bool valid;
+	unsigned long vaddr;
+	u64 pteval;
+};
+
+static struct streaming_debug_state debug_state = {
+	.lock = __MUTEX_INITIALIZER(debug_state.lock),
+};
+
+static int streaming_debug_lookup(unsigned long vaddr, u64 *out)
+{
+	struct mm_struct *mm = current->mm;
+	struct vm_area_struct *vma;
+	pgd_t *pgd;
+	p4d_t *p4d;
+	pud_t *pud;
+	pmd_t *pmd;
+	pte_t *pte;
+	spinlock_t *ptl;
+	int ret = -ENOENT;
+
+	if (!mm)
+		return -ESRCH;
+
+	mmap_read_lock(mm);
+	vma = vma_lookup(mm, vaddr);
+	if (!vma)
+		goto unlock;
+
+	pgd = pgd_offset(mm, vaddr);
+	if (pgd_none_or_clear_bad(pgd))
+		goto unlock;
+	p4d = p4d_offset(pgd, vaddr);
+	if (p4d_none_or_clear_bad(p4d))
+		goto unlock;
+	pud = pud_offset(p4d, vaddr);
+	if (pud_none_or_clear_bad(pud))
+		goto unlock;
+	pmd = pmd_offset(pud, vaddr);
+	if (pmd_none(*pmd))
+		goto unlock;
+	if (pmd_trans_huge(*pmd) || pmd_devmap(*pmd)) {
+		/* Streaming forces PTE granularity; report the PMD as-is. */
+		*out = pmd_val(*pmd);
+		ret = 0;
+		goto unlock;
+	}
+	if (pmd_bad(*pmd))
+		goto unlock;
+
+	pte = pte_offset_map_lock(mm, pmd, vaddr, &ptl);
+	if (!pte)
+		goto unlock;
+	*out = pte_val(ptep_get(pte));
+	ret = 0;
+	pte_unmap_unlock(pte, ptl);
+
+unlock:
+	mmap_read_unlock(mm);
+	return ret;
+}
+
+static ssize_t streaming_pte_query_write(struct file *f,
+					 const char __user *ubuf,
+					 size_t len, loff_t *ppos)
+{
+	char buf[24];
+	unsigned long vaddr;
+	u64 pteval;
+	int ret;
+
+	if (len == 0 || len >= sizeof(buf))
+		return -EINVAL;
+	if (copy_from_user(buf, ubuf, len))
+		return -EFAULT;
+	buf[len] = '\0';
+
+	ret = kstrtoul(strim(buf), 16, &vaddr);
+	if (ret)
+		return ret;
+
+	ret = streaming_debug_lookup(vaddr, &pteval);
+	if (ret)
+		return ret;
+
+	mutex_lock(&debug_state.lock);
+	debug_state.vaddr = vaddr;
+	debug_state.pteval = pteval;
+	debug_state.valid = true;
+	mutex_unlock(&debug_state.lock);
+	return len;
+}
+
+static int streaming_pte_query_show(struct seq_file *s, void *v)
+{
+	mutex_lock(&debug_state.lock);
+	if (debug_state.valid)
+		seq_printf(s, "%016lx %016llx\n",
+			   debug_state.vaddr, debug_state.pteval);
+	else
+		seq_puts(s, "no-query\n");
+	mutex_unlock(&debug_state.lock);
+	return 0;
+}
+
+static int streaming_pte_query_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, streaming_pte_query_show, NULL);
+}
+
+static const struct file_operations streaming_pte_query_fops = {
+	.owner		= THIS_MODULE,
+	.open		= streaming_pte_query_open,
+	.read		= seq_read,
+	.write		= streaming_pte_query_write,
+	.llseek		= seq_lseek,
+	.release	= single_release,
+};
+
+static int __init streaming_debugfs_init(void)
+{
+	struct dentry *dir;
+
+	dir = debugfs_create_dir("streaming", NULL);
+	if (IS_ERR(dir))
+		return PTR_ERR(dir);
+	debugfs_create_file("pte_query", 0600, dir, NULL,
+			    &streaming_pte_query_fops);
+	return 0;
+}
+late_initcall(streaming_debugfs_init);
+
+#endif /* CONFIG_DEBUG_FS */
