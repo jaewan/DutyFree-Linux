@@ -89,6 +89,25 @@ static void pgprot_streaming_idempotent_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, pgprot_val(once), pgprot_val(twice));
 }
 
+static void large_encoding_test(struct kunit *test)
+{
+	pgprotval_t slot6_4k = cachemode2protval(_PAGE_CACHE_MODE_STREAMING);
+	pgprotval_t slot6_large = protval_4k_2_large(slot6_4k);
+	pgprot_t huge = pgprot_streaming_huge(__pgprot(_PAGE_PRESENT));
+
+	/* Slot 6 at PMD/PUD leaf level: PAT selector moves to bit 12. */
+	KUNIT_EXPECT_EQ(test, slot6_large,
+			(pgprotval_t)(_PAGE_PCD | _PAGE_PAT_LARGE));
+	/* Round-trips back to the 4K encoding. */
+	KUNIT_EXPECT_EQ(test, protval_large_2_4k(slot6_large), slot6_4k);
+	/* pgprot_streaming_huge: PAT_LARGE=1, PAT(bit7)=0, PCD=1, PWT=0. */
+	KUNIT_EXPECT_TRUE(test, pgprot_val(huge) & _PAGE_PAT_LARGE);
+	KUNIT_EXPECT_FALSE(test, pgprot_val(huge) & _PAGE_PAT);
+	KUNIT_EXPECT_TRUE(test, pgprot_val(huge) & _PAGE_PCD);
+	KUNIT_EXPECT_FALSE(test, pgprot_val(huge) & _PAGE_PWT);
+	KUNIT_EXPECT_TRUE(test, pgprot_val(huge) & _PAGE_PRESENT);
+}
+
 static void vm_streaming_bit_test(struct kunit *test)
 {
 	/* VM_STREAMING aliases VM_HIGH_ARCH_4 = bit 36. */
@@ -118,6 +137,7 @@ static struct kunit_case streaming_test_cases[] = {
 	KUNIT_CASE(cachemode_table_roundtrip_test),
 	KUNIT_CASE(pgprot_streaming_bits_test),
 	KUNIT_CASE(pgprot_streaming_idempotent_test),
+	KUNIT_CASE(large_encoding_test),
 	KUNIT_CASE(vm_streaming_bit_test),
 	KUNIT_CASE(arch_calc_streaming_bit_test),
 	KUNIT_CASE(arch_validate_prot_test),

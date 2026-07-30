@@ -37,6 +37,9 @@ hmm-tests
 memfd_secret
 soft-dirty
 split_huge_page_test
+streaming_basic
+streaming_hugetlb
+streaming_reject
 ksm_tests
 local_config.h
 local_config.mk

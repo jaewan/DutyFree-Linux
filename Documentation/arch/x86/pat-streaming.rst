@@ -34,6 +34,23 @@ clearing ``_PAGE_CACHE_MASK``. Reverse lookup
 ``_PAGE_CACHE_MODE_STREAMING`` thanks to a fixup in
 ``init_cache_modes()``.
 
+Large pages (hugetlb)
+---------------------
+
+At PMD (2 MiB) and PUD (1 GiB) leaf level bit 7 is PSE, so the PAT
+selector moves to bit 12 (``_PAGE_PAT_LARGE``). The same slot 6 is
+selected by::
+
+    Level            PAT selector          slot-6 encoding
+    4 KiB PTE        bit 7  (PAT)          PAT=1 PCD=1 PWT=0
+    2 MiB PMD leaf   bit 12 (PAT_LARGE)    PSE=1 PAT_LARGE=1 PCD=1 PWT=0
+    1 GiB PUD leaf   bit 12 (PAT_LARGE)    PSE=1 PAT_LARGE=1 PCD=1 PWT=0
+
+``pgprot_streaming_huge()`` (= ``pgprot_4k_2_large(pgprot_streaming())``)
+produces the large-level encoding; hugetlb streaming VMAs carry it in
+``vma->vm_page_prot`` so that hugetlb faults, COW and folio migration
+reinstall slot 6 without extra plumbing.
+
 Userspace ABI
 =============
 
@@ -53,7 +70,12 @@ Constraints checked in ``mm/streaming.c::streaming_validate_entry()``:
 * The target VMA must not be ``VM_PFNMAP``, ``VM_MIXEDMAP`` or
   ``VM_PAT`` - those VMAs already have an owner for the cache bits.
 * Shared writable file-backed mappings are rejected to avoid colliding
-  with the writeback path.
+  with the writeback path. Note that every hugetlb VMA carries a
+  hugetlbfs ``vm_file``, so ``MAP_SHARED`` hugetlb is rejected by this
+  rule while ``MAP_PRIVATE`` hugetlb (2 MiB and 1 GiB) is supported.
+  Excluding shared hugetlb also excludes hugetlb PMD sharing
+  (``VM_MAYSHARE``-only), which is what makes the read-mode hugetlb
+  vma lock in the rewrite walk sufficient.
 * VMAs registered with ``UFFDIO_REGISTER_MODE_WP`` are rejected.
 * Xen PV guests are rejected because their override of
   ``ptep_modify_prot_transaction`` breaks the cache-bit preservation
@@ -100,11 +122,25 @@ bits are rewritten to slot 0, after which ``change_protection()`` and
 ``flush_tlb_range()`` make the region a normal WB mapping again with
 whatever permissions the caller passed.
 
+hugetlb VMAs take the same path with two differences. First, they are
+never split: ``change_protection()`` diverges into
+``hugetlb_change_protection()`` (which only handles R/W/Exec) and the
+cache bits are then rewritten in place at PMD/PUD leaf granularity by
+``streaming_hugetlb_entry()`` under ``huge_pte_lock()``, using
+``_PAGE_LARGE_CACHE_MASK`` and the bit-12 encoding above, followed by
+``flush_hugetlb_tlb_range()``. Second, because ``huge_pte_modify()``
+does not preserve bit 12, a huge pte passing through
+``hugetlb_change_protection()`` mid-transition briefly carries a
+different slot (slot 4, programmed WB, on entry; slot 2, UC-, on
+exit). Both transients are coherent and bounded by the
+``mmap_write_lock`` holder; the rewrite pass immediately follows.
+
 Future-fault PTE construction is handled by an override in
 ``vma_set_page_prot()``: when ``VM_STREAMING`` is set, the cached
-``vma->vm_page_prot`` is post-processed by ``pgprot_streaming()`` so
-that page faults, COW and swap-in all install slot-6 PTEs without
-any extra plumbing in the fault path.
+``vma->vm_page_prot`` is post-processed by ``pgprot_streaming()``
+(``pgprot_streaming_huge()`` for hugetlb) so that page faults, COW and
+swap-in all install slot-6 PTEs without any extra plumbing in the
+fault path.
 
 Observability
 =============
@@ -112,9 +148,11 @@ Observability
 * ``/proc/PID/smaps`` marks streaming VMAs with ``sm`` in the
   ``VmFlags`` line.
 * ``/sys/kernel/debug/streaming/pte_query`` (prototype, root only)
-  takes a hex virtual address and reports the raw PTE value for the
-  writer's own ``mm``. Used by the kselftest to verify that the
-  expected cache bits are installed.
+  takes a hex virtual address and reports
+  ``<vaddr_hex> <pte_hex> <level_shift>`` for the writer's own ``mm``,
+  where ``level_shift`` is 12 (4 KiB PTE), 21 (2 MiB PMD leaf) or
+  30 (1 GiB PUD leaf). Used by the kselftests to verify that the
+  expected cache bits are installed at the expected level.
 
 Out of scope
 ============
@@ -134,13 +172,21 @@ Hand-off to gem5 / simulators
 ==============================
 
 A page walker that wants to enable the H2 hardware obligation
-(directory bypass + silent clean discard) should treat the PTE as
+(directory bypass + silent clean discard) should treat a 4 KiB PTE as
 Streaming iff::
 
     (PTE & _PAGE_PRESENT) &&
     (PTE & _PAGE_PAT) &&
     (PTE & _PAGE_PCD) &&
     !(PTE & _PAGE_PWT)
+
+and a PMD/PUD *leaf* entry (PSE set) as Streaming iff::
+
+    (E & _PAGE_PRESENT) &&
+    (E & _PAGE_PSE) &&
+    (E & _PAGE_PAT_LARGE) &&      /* bit 12 */
+    (E & _PAGE_PCD) &&
+    !(E & _PAGE_PWT)
 
 Reads behave exactly like WB; the additional semantics are entirely a
 contract between the kernel and the simulator.
