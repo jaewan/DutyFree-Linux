@@ -2,6 +2,7 @@
 #ifndef __ASM_MMAN_H__
 #define __ASM_MMAN_H__
 
+#include <linux/types.h>
 #include <uapi/asm/mman.h>
 
 #ifdef CONFIG_X86_INTEL_MEMORY_PROTECTION_KEYS
