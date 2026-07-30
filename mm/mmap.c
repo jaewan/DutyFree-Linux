@@ -100,10 +100,16 @@ void vma_set_page_prot(struct vm_area_struct *vma)
 	/*
 	 * Streaming VMAs must always carry the PAT slot-6 cache encoding so
 	 * that newly faulted (or swap-/COW-restored) pages get the right
-	 * cache mode without any extra plumbing in the fault path.
+	 * cache mode without any extra plumbing in the fault path. hugetlb
+	 * needs the large-page encoding (PAT selector at bit 12, not 7):
+	 * make_huge_pte() and hugetlb migration consume vm_page_prot
+	 * as-is, and the 4K encoding would decode as slot 2 (UC-) at
+	 * PMD/PUD leaf level.
 	 */
 	if (is_streaming_vma(vma))
-		vm_page_prot = pgprot_streaming(vm_page_prot);
+		vm_page_prot = is_vm_hugetlb_page(vma) ?
+			pgprot_streaming_huge(vm_page_prot) :
+			pgprot_streaming(vm_page_prot);
 	/* remove_protection_ptes reads vma->vm_page_prot without mmap_lock */
 	WRITE_ONCE(vma->vm_page_prot, vm_page_prot);
 }

@@ -1143,6 +1143,10 @@ static inline void ptep_modify_prot_commit(struct vm_area_struct *vma,
 #define pgprot_streaming(prot)	(prot)
 #endif
 
+#ifndef pgprot_streaming_huge
+#define pgprot_streaming_huge pgprot_streaming
+#endif
+
 #ifndef pgprot_device
 #define pgprot_device pgprot_noncached
 #endif

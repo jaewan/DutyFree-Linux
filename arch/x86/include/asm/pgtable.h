@@ -25,6 +25,15 @@
 	__pgprot((pgprot_val(prot) & ~_PAGE_CACHE_MASK) |		\
 		 cachemode2protval(_PAGE_CACHE_MODE_STREAMING))
 
+/*
+ * Streaming encoding for large-page (PMD/PUD leaf) protections: bit 7
+ * is PSE at leaf level, so the PAT selector moves to bit 12
+ * (_PAGE_PAT_LARGE). Used for hugetlb VMAs whose vm_page_prot must
+ * carry the slot-6 encoding in the format make_huge_pte() consumes.
+ */
+#define pgprot_streaming_huge(prot)					\
+	pgprot_4k_2_large(pgprot_streaming(prot))
+
 #ifndef __ASSEMBLY__
 #include <linux/spinlock.h>
 #include <asm/x86_init.h>

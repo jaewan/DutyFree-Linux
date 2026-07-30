@@ -72,9 +72,58 @@ static int streaming_pte_entry(pte_t *pte, unsigned long addr,
 	return 0;
 }
 
+#ifdef CONFIG_HUGETLB_PAGE
+/*
+ * hugetlb leaves are rewritten in place at PMD (2 MiB) or PUD (1 GiB)
+ * granularity. At leaf level bit 7 is PSE, so the PAT selector moves
+ * to bit 12 (_PAGE_PAT_LARGE); protval_4k_2_large() converts the 4K
+ * target encoding accordingly (slot 6 stays slot 6).
+ *
+ * walk_hugetlb_range() holds the hugetlb vma lock in read mode, which
+ * keeps the page tables from being freed but does not protect the pte
+ * contents - take the huge_pte lock ourselves. Read-mode is sufficient
+ * against PMD unsharing because sharing requires VM_MAYSHARE and
+ * streaming_validate_entry() rejects all shared file-backed VMAs.
+ */
+static int streaming_hugetlb_entry(pte_t *ptep, unsigned long hmask,
+				   unsigned long addr, unsigned long next,
+				   struct mm_walk *walk)
+{
+	struct streaming_walk_ctx *ctx = walk->private;
+	struct hstate *h = hstate_vma(walk->vma);
+	pteval_t target = protval_4k_2_large(ctx->target_cache_bits);
+	spinlock_t *ptl;
+	pteval_t newval;
+	pte_t old;
+	int ret = 0;
+
+	ptl = huge_pte_lock(h, walk->mm, ptep);
+	old = huge_ptep_get(ptep);
+	if (huge_pte_none(old))
+		/* hole - a later fault installs bits from vm_page_prot */
+		goto out;
+	if (!pte_present(old)) {
+		/* migration / hwpoison / pte marker - prototype rejects */
+		ret = -EBUSY;
+		goto out;
+	}
+
+	newval = (pte_val(old) & ~_PAGE_LARGE_CACHE_MASK) | target;
+	if (newval != pte_val(old))
+		set_huge_pte_at(walk->mm, addr & hmask, ptep, __pte(newval),
+				huge_page_size(h));
+out:
+	spin_unlock(ptl);
+	return ret;
+}
+#else
+#define streaming_hugetlb_entry	NULL
+#endif
+
 static const struct mm_walk_ops streaming_walk_ops = {
 	.pmd_entry	= streaming_pmd_entry,
 	.pte_entry	= streaming_pte_entry,
+	.hugetlb_entry	= streaming_hugetlb_entry,
 	.walk_lock	= PGWALK_WRLOCK_VERIFY,
 };
 
@@ -130,6 +179,10 @@ int streaming_validate_entry(struct vm_area_struct *vma)
  * already happened and the new R/W/Exec state is in place; the
  * cache-bit rewrite is then committed under each PTE lock and the
  * range is invalidated in every CPU's TLB.
+ *
+ * hugetlb VMAs are not split; their PMD/PUD leaves are rewritten in
+ * place with the large-page PAT encoding (bit 12 instead of bit 7)
+ * by streaming_hugetlb_entry().
  */
 int streaming_apply_cache_bits(struct vm_area_struct *vma,
 			       unsigned long start, unsigned long end,
@@ -153,7 +206,10 @@ int streaming_apply_cache_bits(struct vm_area_struct *vma,
 	 * cache bits were re-written after that, so we need a fresh
 	 * range invalidation here.
 	 */
-	flush_tlb_range(vma, start, end);
+	if (is_vm_hugetlb_page(vma))
+		flush_hugetlb_tlb_range(vma, start, end);
+	else
+		flush_tlb_range(vma, start, end);
 	return 0;
 }
 
@@ -182,8 +238,11 @@ void streaming_writeback_all(void)
  *
  * Protocol:
  *   - Write a hex virtual address (e.g. "7fff5e4c1000") to the file.
- *   - Read back a single line "<vaddr_hex> <pte_hex>\n" with the raw
- *     PTE value as observed by the caller's own mm.
+ *   - Read back a single line "<vaddr_hex> <pte_hex> <level_shift>\n"
+ *     with the raw PTE value as observed by the caller's own mm.
+ *     level_shift is 12 for a 4K PTE, 21 for a 2MB PMD leaf and 30
+ *     for a 1GB PUD leaf (hugetlb). Consumers that only sscanf the
+ *     first two tokens keep working.
  *
  * Only the writer's own address space is inspected; there is no path
  * to read another task's PTEs.
@@ -196,13 +255,15 @@ struct streaming_debug_state {
 	bool valid;
 	unsigned long vaddr;
 	u64 pteval;
+	unsigned int level_shift;
 };
 
 static struct streaming_debug_state debug_state = {
 	.lock = __MUTEX_INITIALIZER(debug_state.lock),
 };
 
-static int streaming_debug_lookup(unsigned long vaddr, u64 *out)
+static int streaming_debug_lookup(unsigned long vaddr, u64 *out,
+				  unsigned int *level_shift)
 {
 	struct mm_struct *mm = current->mm;
 	struct vm_area_struct *vma;
@@ -229,14 +290,31 @@ static int streaming_debug_lookup(unsigned long vaddr, u64 *out)
 	if (p4d_none_or_clear_bad(p4d))
 		goto unlock;
 	pud = pud_offset(p4d, vaddr);
-	if (pud_none_or_clear_bad(pud))
+	if (pud_none(*pud))
+		goto unlock;
+	if (pud_leaf(*pud)) {
+		/*
+		 * 1GB hugetlb leaf. Must be tested before
+		 * pud_none_or_clear_bad(): pud_bad() is true for a leaf
+		 * PUD and pud_clear_bad() would wipe the live mapping.
+		 */
+		*out = pud_val(*pud);
+		*level_shift = PUD_SHIFT;
+		ret = 0;
+		goto unlock;
+	}
+	if (pud_bad(*pud))
 		goto unlock;
 	pmd = pmd_offset(pud, vaddr);
 	if (pmd_none(*pmd))
 		goto unlock;
-	if (pmd_trans_huge(*pmd) || pmd_devmap(*pmd)) {
-		/* Streaming forces PTE granularity; report the PMD as-is. */
+	if (pmd_leaf(*pmd) || pmd_devmap(*pmd)) {
+		/*
+		 * 2MB leaf (hugetlb or a stray THP/devmap). Streaming
+		 * splits THP but keeps hugetlb PMDs; report as-is.
+		 */
 		*out = pmd_val(*pmd);
+		*level_shift = PMD_SHIFT;
 		ret = 0;
 		goto unlock;
 	}
@@ -247,6 +325,7 @@ static int streaming_debug_lookup(unsigned long vaddr, u64 *out)
 	if (!pte)
 		goto unlock;
 	*out = pte_val(ptep_get(pte));
+	*level_shift = PAGE_SHIFT;
 	ret = 0;
 	pte_unmap_unlock(pte, ptl);
 
@@ -261,6 +340,7 @@ static ssize_t streaming_pte_query_write(struct file *f,
 {
 	char buf[24];
 	unsigned long vaddr;
+	unsigned int level_shift;
 	u64 pteval;
 	int ret;
 
@@ -274,13 +354,14 @@ static ssize_t streaming_pte_query_write(struct file *f,
 	if (ret)
 		return ret;
 
-	ret = streaming_debug_lookup(vaddr, &pteval);
+	ret = streaming_debug_lookup(vaddr, &pteval, &level_shift);
 	if (ret)
 		return ret;
 
 	mutex_lock(&debug_state.lock);
 	debug_state.vaddr = vaddr;
 	debug_state.pteval = pteval;
+	debug_state.level_shift = level_shift;
 	debug_state.valid = true;
 	mutex_unlock(&debug_state.lock);
 	return len;
@@ -290,8 +371,9 @@ static int streaming_pte_query_show(struct seq_file *s, void *v)
 {
 	mutex_lock(&debug_state.lock);
 	if (debug_state.valid)
-		seq_printf(s, "%016lx %016llx\n",
-			   debug_state.vaddr, debug_state.pteval);
+		seq_printf(s, "%016lx %016llx %u\n",
+			   debug_state.vaddr, debug_state.pteval,
+			   debug_state.level_shift);
 	else
 		seq_puts(s, "no-query\n");
 	mutex_unlock(&debug_state.lock);
