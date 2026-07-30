@@ -121,6 +121,7 @@ void play_dead_common(void);
 void wbinvd_on_cpu(int cpu);
 int wbinvd_on_all_cpus(void);
 void wbnoinvd_on_all_cpus(void);
+void wbnoinvd_on_each_core(void);
 
 void smp_kick_mwait_play_dead(void);
 
@@ -169,6 +170,10 @@ static inline int wbinvd_on_all_cpus(void)
 	return 0;
 }
 static inline void wbnoinvd_on_all_cpus(void)
+{
+	wbnoinvd();
+}
+static inline void wbnoinvd_on_each_core(void)
 {
 	wbnoinvd();
 }

@@ -110,8 +110,12 @@ Entry (WB to Streaming) under ``mmap_write_lock``:
    ``flush_tlb_range()``. After this point every CPU sees
    read-only-Streaming PTEs.
 #. ``do_mprotect_pkey()`` calls ``tlb_finish_mmu()`` (the usual
-   change_protection flush) and then ``wbnoinvd_on_all_cpus()`` to
-   push any residual dirty cache lines to RAM. On CPUs without
+   change_protection flush) and then ``wbnoinvd_on_each_core()`` to
+   push any residual dirty cache lines to RAM. The broadcast targets
+   one logical CPU per physical core: SMT siblings share every cache
+   level, so one WBNOINVD per core provides the same coherence
+   guarantee while avoiding the ~2x sibling contention of a
+   full-logical-CPU broadcast. On CPUs without
    ``X86_FEATURE_WBNOINVD`` this falls back to ``WBINVD`` via the
    ALTERNATIVE() machinery; the memory-coherence guarantee is the
    same, only the cache-preservation property is lost.
