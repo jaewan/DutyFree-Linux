@@ -69,13 +69,24 @@ Constraints checked in ``mm/streaming.c::streaming_validate_entry()``:
   of the mode.
 * The target VMA must not be ``VM_PFNMAP``, ``VM_MIXEDMAP`` or
   ``VM_PAT`` - those VMAs already have an owner for the cache bits.
-* Shared writable file-backed mappings are rejected to avoid colliding
-  with the writeback path. Note that every hugetlb VMA carries a
-  hugetlbfs ``vm_file``, so ``MAP_SHARED`` hugetlb is rejected by this
-  rule while ``MAP_PRIVATE`` hugetlb (2 MiB and 1 GiB) is supported.
-  Excluding shared hugetlb also excludes hugetlb PMD sharing
-  (``VM_MAYSHARE``-only), which is what makes the read-mode hugetlb
-  vma lock in the rewrite walk sufficient.
+* Shared file-backed mappings are rejected to avoid colliding with the
+  writeback path, with one exception: a *sealed memfd* - a shmem file
+  carrying ``F_SEAL_WRITE``, ``F_SEAL_GROW`` and ``F_SEAL_SHRINK`` - that
+  is currently mapped exactly once. ``F_SEAL_WRITE`` cannot be applied
+  while a writable mapping exists and forbids creating one afterwards, so
+  there are no dirty page-cache entries for writeback to race against,
+  and shmem pages to swap rather than to a backing file. The
+  single-mapper requirement stands in for I0: with several mappers a
+  frame's memory type would have to be agreed across address spaces,
+  which this prototype does not do. It is a point-in-time check, not a
+  guarantee - nothing prevents a second ``mmap()`` immediately after.
+  Note that every hugetlb VMA carries a hugetlbfs ``vm_file``, so
+  ``MAP_SHARED`` hugetlb is still rejected while ``MAP_PRIVATE`` hugetlb
+  (2 MiB and 1 GiB) is supported; ``shmem_file()`` tests for shmem
+  address-space ops, so a hugetlbfs-backed memfd (``MFD_HUGETLB``) never
+  takes the sealed exception. Excluding shared hugetlb therefore still
+  excludes hugetlb PMD sharing (``VM_MAYSHARE``-only), which is what makes
+  the read-mode hugetlb vma lock in the rewrite walk sufficient.
 * VMAs registered with ``UFFDIO_REGISTER_MODE_WP`` are rejected.
 * Xen PV guests are rejected because their override of
   ``ptep_modify_prot_transaction`` breaks the cache-bit preservation
@@ -168,7 +179,8 @@ This prototype intentionally does not handle:
   swap-paged pages instead of integrating with the page-out path);
 * KVM memslot fences (a guest may observe a slot 6 mapping today);
 * multiple concurrent streaming users contending on the same
-  physical pages.
+  physical pages (which is why a sealed memfd is admitted only while
+  it has a single mapper).
 
 These are tracked as follow-up steps B-F in the design plan.
 
