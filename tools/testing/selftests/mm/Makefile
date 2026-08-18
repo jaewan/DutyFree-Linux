@@ -83,6 +83,7 @@ CAN_BUILD_WITH_NOPIE := $(shell ./../x86/check_cc.sh "$(CC)" ../x86/trivial_prog
 TEST_GEN_FILES += streaming_basic
 TEST_GEN_FILES += streaming_reject
 TEST_GEN_FILES += streaming_hugetlb
+TEST_GEN_FILES += streaming_memfd
 
 VMTARGETS := protection_keys
 BINARIES_32 := $(VMTARGETS:%=%_32)

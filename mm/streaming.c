@@ -14,11 +14,13 @@
 
 #include <linux/mm.h>
 #include <linux/debugfs.h>
+#include <linux/fcntl.h>
 #include <linux/hugetlb.h>
 #include <linux/init.h>
 #include <linux/mutex.h>
 #include <linux/pagewalk.h>
 #include <linux/sched/mm.h>
+#include <linux/shmem_fs.h>
 #include <linux/seq_file.h>
 #include <linux/uaccess.h>
 #include <linux/userfaultfd_k.h>
@@ -82,8 +84,11 @@ static int streaming_pte_entry(pte_t *pte, unsigned long addr,
  * walk_hugetlb_range() holds the hugetlb vma lock in read mode, which
  * keeps the page tables from being freed but does not protect the pte
  * contents - take the huge_pte lock ourselves. Read-mode is sufficient
- * against PMD unsharing because sharing requires VM_MAYSHARE and
- * streaming_validate_entry() rejects all shared file-backed VMAs.
+ * against PMD unsharing because sharing requires VM_MAYSHARE, and the only
+ * shared file-backed VMAs streaming_validate_entry() admits are single-mapper
+ * sealed memfds, which are shmem: shmem_file() tests for shmem_aops, so a
+ * hugetlbfs-backed memfd (MFD_HUGETLB) never passes and hugetlb PMD sharing
+ * stays unreachable here.
  */
 static int streaming_hugetlb_entry(pte_t *ptep, unsigned long hmask,
 				   unsigned long addr, unsigned long next,
@@ -132,6 +137,68 @@ static const struct mm_walk_ops streaming_walk_ops = {
  * would corrupt other subsystems' invariants. Called with
  * mmap_write_lock held.
  */
+/*
+ * Seals a shared carrier must hold to be admitted. F_SEAL_WRITE supplies I1
+ * (no writer exists for the epoch) at object scope rather than per-mapping:
+ * it cannot be applied while a writable mapping exists, and no writable
+ * mapping can be created afterwards. F_SEAL_GROW/F_SEAL_SHRINK are required
+ * because a resize during an epoch would change the frame set underneath an
+ * already-recorded memory type.
+ */
+#define STREAMING_REQUIRED_SEALS \
+	(F_SEAL_WRITE | F_SEAL_GROW | F_SEAL_SHRINK)
+
+/*
+ * I0 requires every mapping of a frame to agree on its memory type, and this
+ * prototype has no cross-mm mechanism to enforce that (the "multiple
+ * concurrent streaming users contending on the same physical pages" item in
+ * Documentation/arch/x86/pat-streaming.rst). So admit a shared object only
+ * while this VMA is its only mapper.
+ *
+ * This is a point-in-time check: nothing here prevents a second mmap()
+ * immediately afterwards. It is a prototype restriction, not a guarantee, and
+ * closing it is the multi-mapper work tracked as steps B-F.
+ */
+static bool streaming_single_mapper(struct vm_area_struct *self)
+{
+	struct address_space *mapping = self->vm_file->f_mapping;
+	struct vm_area_struct *vma;
+	bool only_self = true;
+
+	i_mmap_lock_read(mapping);
+	vma_interval_tree_foreach(vma, &mapping->i_mmap, 0, ULONG_MAX) {
+		if (vma != self) {
+			only_self = false;
+			break;
+		}
+	}
+	i_mmap_unlock_read(mapping);
+
+	return only_self;
+}
+
+/*
+ * A sealed memfd is the one shared carrier the writeback objection below does
+ * not describe: under F_SEAL_WRITE there are no dirty page-cache entries to
+ * have writeback in flight against, and shmem pages to swap rather than
+ * writing back to a backing file.
+ */
+static bool streaming_sealed_memfd_ok(struct vm_area_struct *vma)
+{
+	unsigned int seals;
+
+	if (!IS_ENABLED(CONFIG_SHMEM))
+		return false;
+	if (!shmem_file(vma->vm_file))
+		return false;
+
+	seals = SHMEM_I(file_inode(vma->vm_file))->seals;
+	if ((seals & STREAMING_REQUIRED_SEALS) != STREAMING_REQUIRED_SEALS)
+		return false;
+
+	return streaming_single_mapper(vma);
+}
+
 int streaming_validate_entry(struct vm_area_struct *vma)
 {
 	/*
@@ -158,7 +225,8 @@ int streaming_validate_entry(struct vm_area_struct *vma)
 	 * against dirty page-cache entries; mixing that with Streaming
 	 * cache semantics is a footgun.
 	 */
-	if ((vma->vm_flags & VM_SHARED) && vma->vm_file)
+	if ((vma->vm_flags & VM_SHARED) && vma->vm_file &&
+	    !streaming_sealed_memfd_ok(vma))
 		return -EINVAL;
 
 	/*
