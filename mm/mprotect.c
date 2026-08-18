@@ -731,6 +731,7 @@ static int do_mprotect_pkey(unsigned long start, size_t len,
 	const bool rier = (current->personality & READ_IMPLIES_EXEC) &&
 				(prot & PROT_READ);
 	bool streaming_writeback_needed = false;
+	unsigned long drain_start = 0, drain_end = 0;
 	struct mmu_gather tlb;
 	struct vma_iterator vmi;
 
@@ -862,8 +863,24 @@ static int do_mprotect_pkey(unsigned long start, size_t len,
 
 		if (IS_ENABLED(CONFIG_PAT_STREAMING) &&
 		    !(vma->vm_flags & VM_STREAMING) &&
-		    (newflags & VM_STREAMING))
+		    (newflags & VM_STREAMING) &&
+		    !streaming_drain_at_exit_enabled())
 			streaming_writeback_needed = true;
+
+		/*
+		 * Exit drain: record the span leaving Streaming so it can be
+		 * flushed by line after the type flip, instead of paying a
+		 * machine-wide writeback on the way in. The range is
+		 * contiguous across this loop, so a span suffices.
+		 */
+		if (IS_ENABLED(CONFIG_PAT_STREAMING) &&
+		    (vma->vm_flags & VM_STREAMING) &&
+		    !(newflags & VM_STREAMING) &&
+		    streaming_drain_at_exit_enabled()) {
+			if (!drain_end)
+				drain_start = nstart;
+			drain_end = tmp;
+		}
 
 		error = mprotect_fixup(&vmi, &tlb, vma, &prev, nstart, tmp, newflags);
 		if (error)
@@ -884,6 +901,15 @@ static int do_mprotect_pkey(unsigned long start, size_t len,
 	 */
 	if (streaming_writeback_needed && !error)
 		streaming_writeback_all();
+
+	/*
+	 * Ranged alternative: drain only the object that left the epoch. Costs
+	 * O(object) rather than O(machine), and removes the unprivileged
+	 * machine-wide stall that entry-time WBNOINVD hands to every other
+	 * tenant. Still under mmap_write_lock, which the page walk requires.
+	 */
+	if (drain_end && !error)
+		streaming_drain_range(current->mm, drain_start, drain_end);
 
 	if (!error && tmp < end)
 		error = -ENOMEM;

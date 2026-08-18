@@ -27,6 +27,7 @@
 
 #include <xen/xen.h>
 
+#include <asm/cacheflush.h>
 #include <asm/pgtable.h>
 #include <asm/smp.h>
 #include <asm/special_insns.h>
@@ -282,6 +283,95 @@ int streaming_apply_cache_bits(struct vm_area_struct *vma,
 }
 
 /*
+ * ---------------------------------------------------------------------
+ * Ranged exit drain.
+ *
+ * The entry path's machine-wide WBNOINVD costs ~48 ms, is size-independent,
+ * and scales with logical-CPU count rather than object size. Since declaring
+ * an epoch is by design unprivileged, that makes it a denial-of-service
+ * primitive on a shared host: a 4 KiB epoch costs the same as a 256 MiB one
+ * and the declarer does not pay it.
+ *
+ * It is also conservative rather than necessary under H2-only semantics.
+ * WB and Streaming are both coherent cacheable types, so a dirty line left
+ * in a cache at entry is still findable by coherence and a later Streaming
+ * read snoops it -- there is no data hazard on the read path. The hazard is
+ * at the other end: stale clean Streaming lines must not survive into a
+ * differently-typed reuse of the frame. That is an exit/reclaim concern, and
+ * unlike a writeback of every cache it can be ranged over the object.
+ *
+ * NOT sound with H3. H3 declines coherence enrolment, so a dirty line left
+ * behind at entry could no longer be located -- H3 requires the entry drain.
+ * The knob therefore defaults off.
+ */
+static bool streaming_drain_at_exit;
+
+bool streaming_drain_at_exit_enabled(void)
+{
+	return streaming_drain_at_exit;
+}
+
+static void streaming_flush_page(struct page *page, unsigned long size)
+{
+	if (!page)
+		return;
+	/*
+	 * Flush through the kernel direct map rather than the user VA: a
+	 * supervisor-mode access to a user page would trip SMAP.
+	 */
+	clflush_cache_range(page_address(page), size);
+}
+
+static int streaming_flush_pte_entry(pte_t *pte, unsigned long addr,
+				     unsigned long next, struct mm_walk *walk)
+{
+	pte_t old = ptep_get(pte);
+
+	if (pte_present(old))
+		streaming_flush_page(pte_page(old), PAGE_SIZE);
+	return 0;
+}
+
+#ifdef CONFIG_HUGETLB_PAGE
+static int streaming_flush_hugetlb_entry(pte_t *ptep, unsigned long hmask,
+					 unsigned long addr, unsigned long next,
+					 struct mm_walk *walk)
+{
+	struct hstate *h = hstate_vma(walk->vma);
+	pte_t old = huge_ptep_get(ptep);
+
+	if (pte_present(old))
+		streaming_flush_page(pte_page(old), huge_page_size(h));
+	return 0;
+}
+#else
+#define streaming_flush_hugetlb_entry NULL
+#endif
+
+static const struct mm_walk_ops streaming_flush_ops = {
+	.pte_entry	= streaming_flush_pte_entry,
+	.hugetlb_entry	= streaming_flush_hugetlb_entry,
+	.walk_lock	= PGWALK_WRLOCK_VERIFY,
+};
+
+/*
+ * Drain [start,end) by line, over whatever VMAs it spans. Only present PTEs
+ * are touched, so an unpopulated hole costs nothing. Called after the PTE
+ * type has been flipped back to WB and the TLB shot down, which is the
+ * ordering the datapath requires.
+ */
+int streaming_drain_range(struct mm_struct *mm, unsigned long start,
+			  unsigned long end)
+{
+	int err;
+
+	if (start >= end)
+		return 0;
+	err = walk_page_range(mm, start, end, &streaming_flush_ops, NULL);
+	return err;
+}
+
+/*
  * Push every dirty cache line back to memory. Used when transitioning
  * a region from WB into Streaming, so that all data the region used
  * to hold is durable in RAM before the Streaming semantics (no
@@ -474,6 +564,8 @@ static int __init streaming_debugfs_init(void)
 	dir = debugfs_create_dir("streaming", NULL);
 	if (IS_ERR(dir))
 		return PTR_ERR(dir);
+	debugfs_create_bool("drain_at_exit", 0600, dir,
+			    &streaming_drain_at_exit);
 	debugfs_create_file("pte_query", 0600, dir, NULL,
 			    &streaming_pte_query_fops);
 	return 0;
