@@ -1831,19 +1831,34 @@ config PAT_STREAMING
 	  semantics to the slot (the H2 hardware obligation from
 	  *The Directory Tax* §4 contract).
 
-	  Entering Streaming write-protects the range, rewrites the PAT
-	  bits, and issues WBNOINVD across all CPUs to push any residual
-	  dirty data to RAM. Leaving Streaming restores plain WB and
-	  applies whatever permissions the user passes to mprotect.
+	  Entering Streaming write-protects the range and rewrites the PAT
+	  bits.  The baseline H2 policy retains ordinary coherence, so it
+	  does not require a cache writeback at entry or exit.  Leaving
+	  Streaming restores plain WB and applies whatever permissions the
+	  user passes to mprotect.
 
-	  Prototype scope: anonymous and private file-backed VMAs only;
-	  PFNMAP, MIXEDMAP, VM_PAT, shared-writable-file, userfaultfd-WP,
-	  and Xen PV mappings are rejected. Pages with swap entries in
-	  the range are also rejected, because Streaming pages must not
-	  be reclaimed under this prototype. See
+	  Prototype scope: private anonymous mappings, private hugetlb
+	  mappings. PFNMAP, MIXEDMAP, VM_PAT, file/shared mappings, KSM-mergeable
+	  mappings, userfaultfd-WP, and Xen PV are rejected. Pages with
+	  swap entries in the range are also rejected. See
 	  Documentation/x86/pat-streaming.rst.
 
 	  If unsure, say N.
+
+config PAT_STREAMING_H3_SEAL_ORACLE
+	bool "Conservative machine-wide H3 seal oracle"
+	depends on PAT_STREAMING
+	default n
+	help
+	  Issue WBNOINVD on one logical CPU per physical core after each
+	  WB-to-Streaming transition.  This establishes a conservative
+	  clean-at-home precondition for experiments with H3 realizations
+	  that cannot resolve an existing dirty owner.
+
+	  This is deliberately not part of PROT_STREAMING's baseline H2
+	  semantics.  It is machine-wide, measured at roughly 48 ms on the
+	  evaluation host, and is retained only as a reproducible oracle.
+	  Do not enable it for normal H2 or end-to-end measurements.
 
 config PAT_STREAMING_KUNIT_TEST
 	tristate "KUnit tests for PAT Streaming" if !KUNIT_ALL_TESTS

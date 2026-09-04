@@ -5,22 +5,20 @@
  * Implements the OS half of the Streaming hardware-software contract
  * from *The Directory Tax* §4. Userspace toggles a region between
  * regular write-back and Streaming via mprotect(PROT_STREAMING); the
- * functions in this file own the PTE cache-bit rewrite and the
- * WBNOINVD broadcast that flush dirty data to memory before the
- * Streaming semantics take effect.
+ * functions in this file own the PTE cache-bit rewrite.  Baseline H2 remains
+ * coherent and needs no cache writeback; an optional build-time H3 oracle owns
+ * the conservative WBNOINVD broadcast.
  */
 
 #define pr_fmt(fmt)	"PAT-Streaming: " fmt
 
 #include <linux/mm.h>
 #include <linux/debugfs.h>
-#include <linux/fcntl.h>
 #include <linux/hugetlb.h>
 #include <linux/init.h>
 #include <linux/mutex.h>
 #include <linux/pagewalk.h>
 #include <linux/sched/mm.h>
-#include <linux/shmem_fs.h>
 #include <linux/seq_file.h>
 #include <linux/uaccess.h>
 #include <linux/userfaultfd_k.h>
@@ -84,12 +82,9 @@ static int streaming_pte_entry(pte_t *pte, unsigned long addr,
  *
  * walk_hugetlb_range() holds the hugetlb vma lock in read mode, which
  * keeps the page tables from being freed but does not protect the pte
- * contents - take the huge_pte lock ourselves. Read-mode is sufficient
- * against PMD unsharing because sharing requires VM_MAYSHARE, and the only
- * shared file-backed VMAs streaming_validate_entry() admits are single-mapper
- * sealed memfds, which are shmem: shmem_file() tests for shmem_aops, so a
- * hugetlbfs-backed memfd (MFD_HUGETLB) never passes and hugetlb PMD sharing
- * stays unreachable here.
+ * contents - take the huge_pte lock ourselves. This prototype admits only
+ * private hugetlb VMAs and preflight rejects multiply mapped folios, so PMD
+ * sharing is outside the admitted state space.
  */
 static int streaming_hugetlb_entry(pte_t *ptep, unsigned long hmask,
 				   unsigned long addr, unsigned long next,
@@ -134,72 +129,88 @@ static const struct mm_walk_ops streaming_walk_ops = {
 };
 
 /*
+ * Validate a transition before mprotect() changes VMA flags or permissions.
+ * Every page must already be present, normal, exclusively mapped, and free of
+ * FOLL_PIN references.  In
+ * particular, accepting a hole would let a later read fault install Linux's
+ * globally shared zero page with a conflicting memory type. A present huge PMD
+ * is fine because MM_CP_STREAMING_ENTER will split it before the rewrite pass.
+ * Swap/migration markers are an explicit refusal: discovering one after
+ * mutating protections used to leave a partial request.
+ */
+static int streaming_preflight_pte_entry(pte_t *pte, unsigned long addr,
+					 unsigned long next,
+					 struct mm_walk *walk)
+{
+	pte_t entry = ptep_get(pte);
+	struct page *page;
+
+	if (!pte_present(entry))
+		return -EBUSY;
+
+	page = vm_normal_page(walk->vma, addr, entry);
+	if (!page || page_mapcount(page) > 1 || page_maybe_dma_pinned(page))
+		return -EBUSY;
+
+	return 0;
+}
+
+static int streaming_preflight_pte_hole(unsigned long addr, unsigned long next,
+					int depth, struct mm_walk *walk)
+{
+	return -EBUSY;
+}
+
+static int streaming_preflight_pmd_entry(pmd_t *pmd, unsigned long addr,
+					 unsigned long next,
+					 struct mm_walk *walk)
+{
+	struct page *page;
+
+	if (!pmd_trans_huge(*pmd))
+		return 0;
+	page = pmd_page(*pmd);
+	return page_mapcount(page) > 1 || page_maybe_dma_pinned(page) ?
+		-EBUSY : 0;
+}
+
+#ifdef CONFIG_HUGETLB_PAGE
+static int streaming_preflight_hugetlb_entry(pte_t *ptep, unsigned long hmask,
+					      unsigned long addr,
+					      unsigned long next,
+					      struct mm_walk *walk)
+{
+	pte_t entry = huge_ptep_get(ptep);
+
+	if (!pte_present(entry))
+		return -EBUSY;
+	return page_mapcount(pte_page(entry)) > 1 ||
+	       page_maybe_dma_pinned(pte_page(entry)) ? -EBUSY : 0;
+}
+#else
+#define streaming_preflight_hugetlb_entry NULL
+#endif
+
+static const struct mm_walk_ops streaming_preflight_ops = {
+	.pmd_entry	= streaming_preflight_pmd_entry,
+	.pte_entry	= streaming_preflight_pte_entry,
+	.pte_hole	= streaming_preflight_pte_hole,
+	.hugetlb_entry	= streaming_preflight_hugetlb_entry,
+	.walk_lock	= PGWALK_WRLOCK_VERIFY,
+};
+
+int streaming_preflight_range(struct vm_area_struct *vma,
+			      unsigned long start, unsigned long end)
+{
+	return walk_page_range_vma(vma, start, end, &streaming_preflight_ops,
+				   NULL);
+}
+
+/*
  * Reject VMA types where flipping the cache mode under the mapping
  * would corrupt other subsystems' invariants. Called with
  * mmap_write_lock held.
  */
-/*
- * Seals a shared carrier must hold to be admitted. F_SEAL_WRITE supplies I1
- * (no writer exists for the epoch) at object scope rather than per-mapping:
- * it cannot be applied while a writable mapping exists, and no writable
- * mapping can be created afterwards. F_SEAL_GROW/F_SEAL_SHRINK are required
- * because a resize during an epoch would change the frame set underneath an
- * already-recorded memory type.
- */
-#define STREAMING_REQUIRED_SEALS \
-	(F_SEAL_WRITE | F_SEAL_GROW | F_SEAL_SHRINK)
-
-/*
- * I0 requires every mapping of a frame to agree on its memory type, and this
- * prototype has no cross-mm mechanism to enforce that (the "multiple
- * concurrent streaming users contending on the same physical pages" item in
- * Documentation/arch/x86/pat-streaming.rst). So admit a shared object only
- * while this VMA is its only mapper.
- *
- * This is a point-in-time check: nothing here prevents a second mmap()
- * immediately afterwards. It is a prototype restriction, not a guarantee, and
- * closing it is the multi-mapper work tracked as steps B-F.
- */
-static bool streaming_single_mapper(struct vm_area_struct *self)
-{
-	struct address_space *mapping = self->vm_file->f_mapping;
-	struct vm_area_struct *vma;
-	bool only_self = true;
-
-	i_mmap_lock_read(mapping);
-	vma_interval_tree_foreach(vma, &mapping->i_mmap, 0, ULONG_MAX) {
-		if (vma != self) {
-			only_self = false;
-			break;
-		}
-	}
-	i_mmap_unlock_read(mapping);
-
-	return only_self;
-}
-
-/*
- * A sealed memfd is the one shared carrier the writeback objection below does
- * not describe: under F_SEAL_WRITE there are no dirty page-cache entries to
- * have writeback in flight against, and shmem pages to swap rather than
- * writing back to a backing file.
- */
-static bool streaming_sealed_memfd_ok(struct vm_area_struct *vma)
-{
-	unsigned int seals;
-
-	if (!IS_ENABLED(CONFIG_SHMEM))
-		return false;
-	if (!shmem_file(vma->vm_file))
-		return false;
-
-	seals = SHMEM_I(file_inode(vma->vm_file))->seals;
-	if ((seals & STREAMING_REQUIRED_SEALS) != STREAMING_REQUIRED_SEALS)
-		return false;
-
-	return streaming_single_mapper(vma);
-}
-
 int streaming_validate_entry(struct vm_area_struct *vma)
 {
 	/*
@@ -222,12 +233,26 @@ int streaming_validate_entry(struct vm_area_struct *vma)
 		return -EINVAL;
 
 	/*
-	 * Writable file-backed mappings can have writeback I/O in flight
-	 * against dirty page-cache entries; mixing that with Streaming
-	 * cache semantics is a footgun.
+	 * A shared-anonymous VMA is just as dangerous as a shared file VMA:
+	 * a process inherited across fork can keep an alias to the same folio.
+	 * Shared objects require persistent object-wide epoch state, which this
+	 * VMA-local prototype deliberately does not pretend to provide.
 	 */
-	if ((vma->vm_flags & VM_SHARED) && vma->vm_file &&
-	    !streaming_sealed_memfd_ok(vma))
+	if (vma->vm_flags & VM_SHARED)
+		return -EINVAL;
+
+	/*
+	 * Ordinary private file mappings can still alias the page cache through
+	 * another process or mapping.  Private hugetlb VMAs carry a hugetlbfs
+	 * file internally and are the controlled exception already covered by
+	 * the hugetlb locking rules.
+	 */
+	if (vma->vm_file && !(vma->vm_flags & VM_SHARED) &&
+	    !is_vm_hugetlb_page(vma))
+		return -EINVAL;
+
+	/* KSM could merge the folio with a differently typed VMA after entry. */
+	if (vma->vm_flags & VM_MERGEABLE)
 		return -EINVAL;
 
 	/*
@@ -302,14 +327,9 @@ int streaming_apply_cache_bits(struct vm_area_struct *vma,
  *
  * NOT sound with H3. H3 declines coherence enrolment, so a dirty line left
  * behind at entry could no longer be located -- H3 requires the entry drain.
- * The knob therefore defaults off.
+ * This prototype consequently has no runtime exit-drain mode: changing a
+ * debugfs knob must never weaken the data-correctness contract.
  */
-static bool streaming_drain_at_exit;
-
-bool streaming_drain_at_exit_enabled(void)
-{
-	return streaming_drain_at_exit;
-}
 
 static void streaming_flush_page(struct page *page, unsigned long size)
 {
@@ -372,11 +392,9 @@ int streaming_drain_range(struct mm_struct *mm, unsigned long start,
 }
 
 /*
- * Push every dirty cache line back to memory. Used when transitioning
- * a region from WB into Streaming, so that all data the region used
- * to hold is durable in RAM before the Streaming semantics (no
- * further writes, simulator may silently discard clean evictions)
- * become observable.
+ * Push every dirty cache line back to memory for the optional conservative
+ * H3 seal oracle.  Baseline H2 retains coherent owner lookup and never calls
+ * this function.
  *
  * One WBNOINVD per physical core suffices: SMT siblings share every
  * cache level, and hitting both siblings only doubles the wall-clock
@@ -564,8 +582,6 @@ static int __init streaming_debugfs_init(void)
 	dir = debugfs_create_dir("streaming", NULL);
 	if (IS_ERR(dir))
 		return PTR_ERR(dir);
-	debugfs_create_bool("drain_at_exit", 0600, dir,
-			    &streaming_drain_at_exit);
 	debugfs_create_file("pte_query", 0600, dir, NULL,
 			    &streaming_pte_query_fops);
 	return 0;

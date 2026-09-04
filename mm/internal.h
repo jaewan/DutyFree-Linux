@@ -596,15 +596,22 @@ static inline bool is_streaming_vma(const struct vm_area_struct *vma)
 
 #ifdef CONFIG_PAT_STREAMING
 int streaming_validate_entry(struct vm_area_struct *vma);
+int streaming_preflight_range(struct vm_area_struct *vma,
+			      unsigned long start, unsigned long end);
 int streaming_apply_cache_bits(struct vm_area_struct *vma,
 			       unsigned long start, unsigned long end,
 			       bool to_streaming);
 void streaming_writeback_all(void);
-bool streaming_drain_at_exit_enabled(void);
 int streaming_drain_range(struct mm_struct *mm, unsigned long start,
 			  unsigned long end);
 #else
 static inline int streaming_validate_entry(struct vm_area_struct *vma)
+{
+	return -EOPNOTSUPP;
+}
+static inline int streaming_preflight_range(struct vm_area_struct *vma,
+					     unsigned long start,
+					     unsigned long end)
 {
 	return -EOPNOTSUPP;
 }
@@ -616,7 +623,6 @@ static inline int streaming_apply_cache_bits(struct vm_area_struct *vma,
 	return -EOPNOTSUPP;
 }
 static inline void streaming_writeback_all(void) { }
-static inline bool streaming_drain_at_exit_enabled(void) { return false; }
 static inline int streaming_drain_range(struct mm_struct *mm,
 				       unsigned long start, unsigned long end)
 {

@@ -608,6 +608,9 @@ mprotect_fixup(struct vma_iterator *vmi, struct mmu_gather *tlb,
 		error = streaming_validate_entry(vma);
 		if (error)
 			return error;
+		error = streaming_preflight_range(vma, start, end);
+		if (error)
+			return error;
 	}
 
 	/*
@@ -731,7 +734,7 @@ static int do_mprotect_pkey(unsigned long start, size_t len,
 	const bool rier = (current->personality & READ_IMPLIES_EXEC) &&
 				(prot & PROT_READ);
 	bool streaming_writeback_needed = false;
-	unsigned long drain_start = 0, drain_end = 0;
+	bool streaming_write_protect_seq = false;
 	struct mmu_gather tlb;
 	struct vma_iterator vmi;
 
@@ -748,6 +751,15 @@ static int do_mprotect_pkey(unsigned long start, size_t len,
 	 */
 	if (IS_ENABLED(CONFIG_PAT_STREAMING) &&
 	    (prot & PROT_STREAMING) && (prot & PROT_WRITE))
+		return -EINVAL;
+	/*
+	 * The prototype validates a complete VMA before changing its PTEs.  Do
+	 * not let the generic multi-VMA mprotect loop turn that into a partial
+	 * transition: a later VMA may fail validation after an earlier one has
+	 * already been converted.  A cross-VMA transaction needs the future
+	 * object/folio epoch protocol; reject it until that exists.
+	 */
+	if (IS_ENABLED(CONFIG_PAT_STREAMING) && (prot & PROT_STREAMING) && grows)
 		return -EINVAL;
 
 	if (start & ~PAGE_MASK)
@@ -779,6 +791,11 @@ static int do_mprotect_pkey(unsigned long start, size_t len,
 	error = -ENOMEM;
 	if (!vma)
 		goto out;
+	if (IS_ENABLED(CONFIG_PAT_STREAMING) && (reqprot & PROT_STREAMING) &&
+	    end > vma->vm_end) {
+		error = -EINVAL;
+		goto out;
+	}
 
 	if (unlikely(grows & PROT_GROWSDOWN)) {
 		if (vma->vm_start >= end)
@@ -801,6 +818,19 @@ static int do_mprotect_pkey(unsigned long start, size_t len,
 	prev = vma_prev(&vmi);
 	if (start > vma->vm_start)
 		prev = vma;
+
+	/*
+	 * Serialize the admission preflight and PTE write-protection against
+	 * lockless FOLL_PIN.  A fast pin that overlaps this interval will undo
+	 * itself after observing the changed sequence; slow GUP is excluded by
+	 * mmap_write_lock.  The preflight below can therefore soundly reject any
+	 * pin that predates the epoch.
+	 */
+	if (IS_ENABLED(CONFIG_PAT_STREAMING) &&
+	    (reqprot & PROT_STREAMING) && !(vma->vm_flags & VM_STREAMING)) {
+		raw_write_seqcount_begin(&current->mm->write_protect_seq);
+		streaming_write_protect_seq = true;
+	}
 
 	tlb_gather_mmu(&tlb, current->mm);
 	nstart = start;
@@ -861,26 +891,16 @@ static int do_mprotect_pkey(unsigned long start, size_t len,
 				break;
 		}
 
-		if (IS_ENABLED(CONFIG_PAT_STREAMING) &&
-		    !(vma->vm_flags & VM_STREAMING) &&
-		    (newflags & VM_STREAMING) &&
-		    !streaming_drain_at_exit_enabled())
-			streaming_writeback_needed = true;
-
 		/*
-		 * Exit drain: record the span leaving Streaming so it can be
-		 * flushed by line after the type flip, instead of paying a
-		 * machine-wide writeback on the way in. The range is
-		 * contiguous across this loop, so a span suffices.
+		 * PROT_STREAMING's baseline semantics are H2 and retain ordinary
+		 * coherence, so they need no cache drain.  Keep the old global
+		 * clean only behind the explicit H3 seal-oracle configuration;
+		 * it is not an intrinsic transition cost.
 		 */
-		if (IS_ENABLED(CONFIG_PAT_STREAMING) &&
-		    (vma->vm_flags & VM_STREAMING) &&
-		    !(newflags & VM_STREAMING) &&
-		    streaming_drain_at_exit_enabled()) {
-			if (!drain_end)
-				drain_start = nstart;
-			drain_end = tmp;
-		}
+		if (IS_ENABLED(CONFIG_PAT_STREAMING_H3_SEAL_ORACLE) &&
+		    !(vma->vm_flags & VM_STREAMING) &&
+		    (newflags & VM_STREAMING))
+			streaming_writeback_needed = true;
 
 		error = mprotect_fixup(&vmi, &tlb, vma, &prev, nstart, tmp, newflags);
 		if (error)
@@ -891,25 +911,12 @@ static int do_mprotect_pkey(unsigned long start, size_t len,
 		prot = reqprot;
 	}
 	tlb_finish_mmu(&tlb);
+	if (streaming_write_protect_seq)
+		raw_write_seqcount_end(&current->mm->write_protect_seq);
 
-	/*
-	 * Push every dirty cache line on every CPU back to RAM so the
-	 * memory image of the now-Streaming region is self-consistent
-	 * before the new semantics become observable. The TLB has
-	 * already been invalidated above; no further dirties can be
-	 * queued through the old WB mapping.
-	 */
+	/* Optional conservative H3 seal oracle; never charged to H2. */
 	if (streaming_writeback_needed && !error)
 		streaming_writeback_all();
-
-	/*
-	 * Ranged alternative: drain only the object that left the epoch. Costs
-	 * O(object) rather than O(machine), and removes the unprivileged
-	 * machine-wide stall that entry-time WBNOINVD hands to every other
-	 * tenant. Still under mmap_write_lock, which the page walk requires.
-	 */
-	if (drain_end && !error)
-		streaming_drain_range(current->mm, drain_start, drain_end);
 
 	if (!error && tmp < end)
 		error = -ENOMEM;
