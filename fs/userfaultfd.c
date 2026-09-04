@@ -1396,8 +1396,18 @@ static int userfaultfd_register(struct userfaultfd_ctx *ctx,
 		BUG_ON(!!cur->vm_userfaultfd_ctx.ctx ^
 		       !!(cur->vm_flags & __VM_UFFD_FLAGS));
 
-		/* check not compatible vmas */
+		/*
+		 * A STREAMING VMA is a fully populated immutable epoch.  Installing
+		 * userfaultfd ownership afterwards would re-enable page replacement
+		 * and write-protect state changes that bypass the epoch admission
+		 * checks.
+		 */
 		ret = -EINVAL;
+		if (IS_ENABLED(CONFIG_PAT_STREAMING) &&
+		    (cur->vm_flags & VM_STREAMING))
+			goto out_unlock;
+
+		/* check not compatible vmas */
 		if (!vma_can_userfault(cur, vm_flags, wp_async))
 			goto out_unlock;
 

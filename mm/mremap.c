@@ -820,6 +820,9 @@ static struct vm_area_struct *vma_to_resize(unsigned long addr,
 	vma = vma_lookup(mm, addr);
 	if (!vma)
 		return ERR_PTR(-EFAULT);
+	if (is_streaming_vma(vma) &&
+	    (new_len != old_len || (flags & MREMAP_DONTUNMAP)))
+		return ERR_PTR(-EINVAL);
 
 	/*
 	 * !old_len is a special case where an attempt is made to 'duplicate'

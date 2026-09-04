@@ -1039,6 +1039,16 @@ static int check_vma_flags(struct vm_area_struct *vma, unsigned long gup_flags)
 	if (vm_flags & (VM_IO | VM_PFNMAP))
 		return -EFAULT;
 
+	/*
+	 * STREAMING is an immutable consumption epoch.  In particular,
+	 * FOLL_FORCE must not turn the VMA's retained VM_MAYWRITE bit into a
+	 * kernel-side writable alias (for example through /proc/<pid>/mem or
+	 * ptrace).  Ordinary writes are already blocked by the read-only PTE;
+	 * reject forced and remote GUP writes at the common VMA check as well.
+	 */
+	if (write && is_streaming_vma(vma))
+		return -EFAULT;
+
 	if ((gup_flags & FOLL_ANON) && !vma_anon)
 		return -EFAULT;
 

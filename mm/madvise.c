@@ -1021,6 +1021,35 @@ static int madvise_vma_behavior(struct vm_area_struct *vma,
 	struct anon_vma_name *anon_name;
 	unsigned long new_flags = vma->vm_flags;
 
+	/*
+	 * Keep an admitted epoch fully populated and exclusively typed.  Advice
+	 * that can discard, replace, merge, migrate, or otherwise change its pages
+	 * needs object-epoch integration before it can be allowed here.
+	 */
+	if (is_streaming_vma(vma)) {
+		switch (behavior) {
+		case MADV_NORMAL:
+		case MADV_SEQUENTIAL:
+		case MADV_RANDOM:
+		case MADV_DONTFORK:
+		case MADV_DOFORK:
+		case MADV_DONTDUMP:
+		case MADV_DODUMP:
+		case MADV_UNMERGEABLE:
+		/*
+		 * NOHUGEPAGE only ever removes a way for the range to acquire a
+		 * mapping it must not have (see __thp_vma_allowable_orders), so
+		 * refusing it gave the owner no protection and took away the
+		 * only defensive call it had.  MADV_HUGEPAGE stays refused: it
+		 * asks for the mapping this type forbids.
+		 */
+		case MADV_NOHUGEPAGE:
+			break;
+		default:
+			return -EINVAL;
+		}
+	}
+
 	switch (behavior) {
 	case MADV_REMOVE:
 		return madvise_remove(vma, prev, start, end);
@@ -1073,6 +1102,9 @@ static int madvise_vma_behavior(struct vm_area_struct *vma,
 		break;
 	case MADV_MERGEABLE:
 	case MADV_UNMERGEABLE:
+		/* KSM would create a differently typed physical alias. */
+		if (behavior == MADV_MERGEABLE && is_streaming_vma(vma))
+			return -EINVAL;
 		error = ksm_madvise(vma, start, end, behavior, &new_flags);
 		if (error)
 			goto out;
