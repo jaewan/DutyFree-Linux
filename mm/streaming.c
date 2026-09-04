@@ -311,13 +311,16 @@ int streaming_apply_cache_bits(struct vm_area_struct *vma,
  * ---------------------------------------------------------------------
  * Ranged exit drain.
  *
- * The entry path's machine-wide WBNOINVD costs ~48 ms, is size-independent,
- * and scales with logical-CPU count rather than object size. Since declaring
- * an epoch is by design unprivileged, that makes it a denial-of-service
- * primitive on a shared host: a 4 KiB epoch costs the same as a 256 MiB one
- * and the declarer does not pay it.
+ * Baseline H2 entry performs no cache writeback at all: it changes only
+ * future shared-cache admission. do_mprotect_pkey() reaches the machine-wide
+ * WBNOINVD solely under CONFIG_PAT_STREAMING_H3_SEAL_ORACLE, which is
+ * default n and is documented as not part of baseline H2 semantics. That
+ * oracle clean costs ~48 ms on the 64-logical-CPU evaluation host, is
+ * size-independent, and scales with logical-CPU count rather than object
+ * size -- the wrong granularity for an object-scoped contract, which is why
+ * baseline entry does not use it.
  *
- * It is also conservative rather than necessary under H2-only semantics.
+ * A drain is also conservative rather than necessary under H2-only semantics.
  * WB and Streaming are both coherent cacheable types, so a dirty line left
  * in a cache at entry is still findable by coherence and a later Streaming
  * read snoops it -- there is no data hazard on the read path. The hazard is
@@ -329,6 +332,11 @@ int streaming_apply_cache_bits(struct vm_area_struct *vma,
  * behind at entry could no longer be located -- H3 requires the entry drain.
  * This prototype consequently has no runtime exit-drain mode: changing a
  * debugfs knob must never weaken the data-correctness contract.
+ *
+ * streaming_drain_range() below therefore has no caller. The exit-drain call
+ * site went out with the drain_at_exit knob; the primitive is kept because an
+ * H3 retirement path needs a ranged clean, and reintroducing it as a page walk
+ * is the part that took the care.
  */
 
 static void streaming_flush_page(struct page *page, unsigned long size)
