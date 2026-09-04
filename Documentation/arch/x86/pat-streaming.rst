@@ -69,31 +69,40 @@ Constraints checked in ``mm/streaming.c::streaming_validate_entry()``:
   of the mode.
 * The target VMA must not be ``VM_PFNMAP``, ``VM_MIXEDMAP`` or
   ``VM_PAT`` - those VMAs already have an owner for the cache bits.
-* Shared file-backed mappings are rejected to avoid colliding with the
-  writeback path, with one exception: a *sealed memfd* - a shmem file
-  carrying ``F_SEAL_WRITE``, ``F_SEAL_GROW`` and ``F_SEAL_SHRINK`` - that
-  is currently mapped exactly once. ``F_SEAL_WRITE`` cannot be applied
-  while a writable mapping exists and forbids creating one afterwards, so
-  there are no dirty page-cache entries for writeback to race against,
-  and shmem pages to swap rather than to a backing file. The
-  single-mapper requirement stands in for I0: with several mappers a
-  frame's memory type would have to be agreed across address spaces,
-  which this prototype does not do. It is a point-in-time check, not a
-  guarantee - nothing prevents a second ``mmap()`` immediately after.
-  Note that every hugetlb VMA carries a hugetlbfs ``vm_file``, so
+* Shared mappings, including shared anonymous mappings, are rejected to avoid
+  aliases across fork or another address space. Ordinary private file mappings
+  are also rejected because they can alias the page cache. A sealed memfd is
+  not an exception: seals prevent a writer but do not prevent a later read-only
+  WB mapping, so a one-time mapper count cannot establish I0. Note that every
+  hugetlb VMA carries a hugetlbfs ``vm_file``, so
   ``MAP_SHARED`` hugetlb is still rejected while ``MAP_PRIVATE`` hugetlb
   (2 MiB and 1 GiB) is supported; ``shmem_file()`` tests for shmem
-  address-space ops, so a hugetlbfs-backed memfd (``MFD_HUGETLB``) never
-  takes the sealed exception. Excluding shared hugetlb therefore still
-  excludes hugetlb PMD sharing (``VM_MAYSHARE``-only), which is what makes
-  the read-mode hugetlb vma lock in the rewrite walk sufficient.
-* VMAs registered with ``UFFDIO_REGISTER_MODE_WP`` are rejected.
+  address-space ops, so a hugetlbfs-backed memfd (``MFD_HUGETLB``) is not
+  confused with ordinary shmem. Excluding shared hugetlb also excludes
+  hugetlb PMD sharing (``VM_MAYSHARE``-only), which is what makes the
+  read-mode hugetlb VMA lock in the rewrite walk sufficient.
+* VMAs registered with ``UFFDIO_REGISTER_MODE_WP`` are rejected, and a new
+  userfaultfd registration cannot be installed after entry.
 * Xen PV guests are rejected because their override of
   ``ptep_modify_prot_transaction`` breaks the cache-bit preservation
   this code relies on.
 * Pages that are paged out (swap or migration entries in the range)
   cause the PTE walker to bail with ``-EBUSY``. The caller is expected
-  to populate the range up front, e.g. via ``mlock()`` or a forced read.
+  to populate the range up front, e.g. via ``mlock()`` on the writable
+  construction VMA or a forced write to each page. A read fault may install
+  the shared zero page and is deliberately insufficient.
+* Present pages already mapped elsewhere or carrying a ``FOLL_PIN`` reference
+  are rejected with ``-EBUSY``. Entry brackets preflight and PTE
+  write-protection with ``mm->write_protect_seq``, so a concurrent fast pin
+  backs out; slow GUP is excluded by ``mmap_write_lock``. Subsequent writable
+  GUP, including ``FOLL_FORCE`` through ptrace or ``/proc/PID/mem``, is
+  rejected.
+* ``fork()`` is rejected while an inherited epoch is active. A VMA marked
+  ``MADV_DONTFORK`` is safely omitted and does not block the fork. KSM cannot
+  be enabled after entry. These rules prevent an admitted private object from
+  acquiring an independently retired CPU alias.
+* Advice that discards, replaces, migrates, or merges pages is rejected during
+  an epoch. ``mremap()`` may move a range but may not resize or duplicate it.
 
 Leaving Streaming has no constraints beyond the user supplying a new
 ``prot`` value: the original permissions are *not* remembered by the
@@ -120,18 +129,15 @@ Entry (WB to Streaming) under ``mmap_write_lock``:
    rewrites the cache bits to slot 6, and issues
    ``flush_tlb_range()``. After this point every CPU sees
    read-only-Streaming PTEs.
-#. ``do_mprotect_pkey()`` calls ``tlb_finish_mmu()`` (the usual
-   change_protection flush) and then ``wbnoinvd_on_each_core()`` to
-   push any residual dirty cache lines to RAM. The broadcast targets
-   one logical CPU per physical core: SMT siblings share every cache
-   level, so one WBNOINVD per core provides the same coherence
-   guarantee while avoiding the ~2x sibling contention of a
-   full-logical-CPU broadcast. On CPUs without
-   ``X86_FEATURE_WBNOINVD`` this falls back to ``WBINVD`` via the
-   ALTERNATIVE() machinery; the memory-coherence guarantee is the
-   same, only the cache-preservation property is lost.
+#. ``do_mprotect_pkey()`` calls ``tlb_finish_mmu()`` for the usual
+   translation synchronization.  Baseline H2 retains coherent owner lookup
+   and performs no cache writeback at entry.  If the experimental
+   ``CONFIG_PAT_STREAMING_H3_SEAL_ORACLE`` is enabled, entry additionally
+   calls ``wbnoinvd_on_each_core()`` after the translation transition.  The
+   broadcast is a conservative clean-at-home oracle for H3 realizations that
+   cannot resolve an existing dirty owner; it is not an H2 cost.
 
-Exit (Streaming to WB) is the same shape minus WBNOINVD: the
+Exit (Streaming to WB) is the same shape: the
 ``MM_CP_STREAMING_LEAVE`` flag still forces THP splits and the cache
 bits are rewritten to slot 0, after which ``change_protection()`` and
 ``flush_tlb_range()`` make the region a normal WB mapping again with
@@ -175,12 +181,11 @@ Out of scope
 This prototype intentionally does not handle:
 
 * device-DAX / PFNMAP backings (validation rejects them);
-* KSM / autoNUMA / compaction interactions (the prototype refuses
-  swap-paged pages instead of integrating with the page-out path);
+* autoNUMA / compaction integration (the prototype refuses swap-paged pages
+  instead of integrating with the page-out path);
 * KVM memslot fences (a guest may observe a slot 6 mapping today);
-* multiple concurrent streaming users contending on the same
-  physical pages (which is why a sealed memfd is admitted only while
-  it has a single mapper).
+* shared-file epochs and multiple concurrent streaming users contending on
+  the same physical pages.
 
 These are tracked as follow-up steps B-F in the design plan.
 
