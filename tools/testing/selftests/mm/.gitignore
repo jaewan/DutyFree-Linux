@@ -38,6 +38,8 @@ memfd_secret
 soft-dirty
 split_huge_page_test
 streaming_basic
+streaming_lifecycle
+streaming_memfd
 streaming_hugetlb
 streaming_reject
 ksm_tests
