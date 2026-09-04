@@ -107,6 +107,27 @@ unsigned long __thp_vma_allowable_orders(struct vm_area_struct *vma,
 	if (transparent_hugepage_flags & (1 << TRANSPARENT_HUGEPAGE_UNSUPPORTED))
 		return 0;
 
+	/*
+	 * A sealed STREAMING range must never be backed by a huge mapping that
+	 * this path could build.  vma_set_page_prot() installs the 4K slot-6
+	 * encoding (PAT selector at bit 7) for every non-hugetlb streaming VMA;
+	 * at a PMD/PUD leaf bit 7 is PSE and the selector moves to bit 12, which
+	 * is clear, so the same vm_page_prot decodes as slot 2 -- UC-.  A THP
+	 * collapse over a sealed anonymous range would therefore silently turn
+	 * it uncacheable, with no error to the owner and nothing in the type to
+	 * say it happened.  hugetlb is unaffected: it gets the large-page
+	 * encoding from pgprot_streaming_huge() and never comes through here.
+	 *
+	 * Refuse rather than repaint.  Handing this path the huge encoding would
+	 * mean an epoch whose cache type depends on whether khugepaged happened
+	 * to run, and the point of the type is that it does not depend on that.
+	 *
+	 * Read the caller's vm_flags, as the VM_NOHUGEPAGE check above does:
+	 * callers pass hypothetical flags here and must get the answer for those.
+	 */
+	if (IS_ENABLED(CONFIG_PAT_STREAMING) && (vm_flags & VM_STREAMING))
+		return 0;
+
 	/* khugepaged doesn't collapse DAX vma, but page fault is fine. */
 	if (vma_is_dax(vma))
 		return in_pf ? orders : 0;
