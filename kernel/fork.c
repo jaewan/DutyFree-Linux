@@ -627,6 +627,7 @@ static __latent_entropy int dup_mmap(struct mm_struct *mm,
 					struct mm_struct *oldmm)
 {
 	struct vm_area_struct *mpnt, *tmp;
+	VMA_ITERATOR(old_vmi, oldmm, 0);
 	int retval;
 	unsigned long charge = 0;
 	LIST_HEAD(uf);
@@ -636,6 +637,32 @@ static __latent_entropy int dup_mmap(struct mm_struct *mm,
 	if (mmap_write_lock_killable(oldmm)) {
 		retval = -EINTR;
 		goto fail_uprobe_end;
+	}
+	/*
+	 * Reject a copied Streaming VMA before duplicating the maple tree.  The
+	 * check below used to happen only after __mt_dup(), so allocation pressure
+	 * could turn this deterministic ABI refusal into ENOMEM.  VM_DONTCOPY is
+	 * the explicitly admitted fork case: the child receives no alias.
+	 */
+	if (IS_ENABLED(CONFIG_PAT_STREAMING)) {
+		for_each_vma(old_vmi, mpnt) {
+			if ((mpnt->vm_flags & VM_STREAMING) &&
+			    !(mpnt->vm_flags & VM_DONTCOPY)) {
+				retval = -EBUSY;
+				/*
+				 * NOT `goto out`: mm->mmap_lock is not taken
+				 * until the mmap_write_lock_nested() below, so
+				 * out's mmap_write_unlock(mm) would release an
+				 * rwsem this path never acquired.  That
+				 * corrupts the new mm's lock and wedges its
+				 * teardown -- observed as a 100%-CPU livelock
+				 * with no forward progress in
+				 * tools/testing/selftests/mm/streaming_reject
+				 * test 12 (fork after MADV_DOFORK).
+				 */
+				goto out_oldmm_only;
+			}
+		}
 	}
 	flush_cache_dup_mm(oldmm);
 	uprobe_dup_mmap(oldmm, mm);
@@ -771,6 +798,14 @@ loop_out:
 	}
 out:
 	mmap_write_unlock(mm);
+out_oldmm_only:
+	/*
+	 * Reached either from out (mm already unlocked) or directly from the
+	 * VM_STREAMING refusal above, which runs before mm is ever locked.
+	 * oldmm's PTEs are untouched on the early path, so the TLB flush is
+	 * redundant there but harmless, and keeping one exit sequence avoids a
+	 * second path that can drift out of step with this one.
+	 */
 	flush_tlb_mm(oldmm);
 	mmap_write_unlock(oldmm);
 	dup_userfaultfd_complete(&uf);
@@ -1704,6 +1739,42 @@ fail_nomem:
 	return NULL;
 }
 
+/*
+ * Does @oldmm carry a Streaming VMA that fork must refuse to copy?
+ *
+ * dup_mmap() already refuses these, but it is reached through dup_mm(), which
+ * returns a struct mm_struct * and therefore drops the errno on the floor --
+ * copy_mm() then reports ENOMEM for what is a deterministic ABI refusal.  This
+ * runs one frame earlier, where -EBUSY can still be returned to the caller.
+ *
+ * Returns -EBUSY if the copy must be refused, -EINTR if the lock wait was
+ * interrupted, 0 otherwise.
+ */
+static int mm_streaming_forbids_dup(struct mm_struct *oldmm)
+{
+	struct vm_area_struct *vma;
+	VMA_ITERATOR(vmi, oldmm, 0);
+	int retval = 0;
+
+	if (!IS_ENABLED(CONFIG_PAT_STREAMING))
+		return 0;
+
+	if (mmap_read_lock_killable(oldmm))
+		return -EINTR;
+
+	for_each_vma(vmi, vma) {
+		/* VM_DONTCOPY is the admitted case: the child gets no alias. */
+		if ((vma->vm_flags & VM_STREAMING) &&
+		    !(vma->vm_flags & VM_DONTCOPY)) {
+			retval = -EBUSY;
+			break;
+		}
+	}
+
+	mmap_read_unlock(oldmm);
+	return retval;
+}
+
 static int copy_mm(unsigned long clone_flags, struct task_struct *tsk)
 {
 	struct mm_struct *mm, *oldmm;
@@ -1731,6 +1802,17 @@ static int copy_mm(unsigned long clone_flags, struct task_struct *tsk)
 		mmget(oldmm);
 		mm = oldmm;
 	} else {
+		int err = mm_streaming_forbids_dup(oldmm);
+
+		/*
+		 * The lock is dropped again before dup_mmap() takes it for
+		 * write, so a VMA could in principle be sealed in between.
+		 * dup_mmap()'s own check still catches that; the race degrades
+		 * the errno to ENOMEM, it does not admit the copy.
+		 */
+		if (err)
+			return err;
+
 		mm = dup_mm(tsk, current->mm);
 		if (!mm)
 			return -ENOMEM;
