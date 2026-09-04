@@ -85,7 +85,7 @@ static int read_pte(unsigned long vaddr, uint64_t *pte_out)
 		return -EIO;
 	buf[n] = '\0';
 
-	if (sscanf(buf, "%*lx %" SCNx64, pte_out) != 1)
+	if (sscanf(buf, "%*x %" SCNx64, pte_out) != 1)
 		return -EIO;
 	return 0;
 }
@@ -119,7 +119,7 @@ int main(void)
 	int ret;
 
 	ksft_print_header();
-	ksft_set_plan(7);
+	ksft_set_plan(10);
 
 	region = mmap(NULL, REGION_SIZE,
 		      PROT_READ | PROT_WRITE,
@@ -129,10 +129,40 @@ int main(void)
 	memset(region, 0xa5, REGION_SIZE);
 	ksft_test_result_pass("mmap RW + populate\n");
 
+	errno = 0;
+	ret = mprotect(region, REGION_SIZE,
+		       PROT_READ | PROT_WRITE | PROT_STREAMING);
+	ksft_test_result(ret == -1 && errno == EINVAL,
+			 "PROT_WRITE|PROT_STREAMING is rejected (errno=%d)\n", errno);
+
+	/* A streaming transition is deliberately one-VMA-only until the kernel
+	 * has a transactional cross-VMA/object epoch protocol. */
+	ret = mprotect((char *)region + REGION_SIZE / 2, REGION_SIZE / 2,
+		       PROT_READ);
+	if (ret)
+		ksft_exit_fail_msg("split VMA setup failed: %m\n");
+	errno = 0;
+	ret = mprotect(region, REGION_SIZE, PROT_READ | PROT_STREAMING);
+	ksft_test_result(ret == -1 && errno == EINVAL,
+			 "cross-VMA PROT_STREAMING is rejected (errno=%d)\n", errno);
+	ret = mprotect(region, REGION_SIZE, PROT_READ | PROT_WRITE);
+	if (ret)
+		ksft_exit_fail_msg("restore split VMA setup failed: %m\n");
+	ksft_test_result_pass("one-VMA setup restored\n");
+
 	ret = mprotect(region, REGION_SIZE, PROT_READ | PROT_STREAMING);
 	if (ret) {
-		if (errno == EINVAL)
-			ksft_exit_skip("PROT_STREAMING rejected (kernel built without CONFIG_PAT_STREAMING?): %m\n");
+		if (errno == EINVAL) {
+			int remaining;
+
+			/* Four generic admission checks already ran.  Report the six
+			 * implementation-specific checks as skips instead of using
+			 * ksft_exit_skip() after publishing a TAP plan. */
+			for (remaining = 0; remaining < 6; remaining++)
+				ksft_test_result_skip("PROT_STREAMING unsupported\n");
+			munmap(region, REGION_SIZE);
+			ksft_finished();
+		}
 		ksft_exit_fail_msg("mprotect(PROT_STREAMING) failed: %m\n");
 	}
 	ksft_test_result_pass("mprotect(PROT_READ|PROT_STREAMING)\n");

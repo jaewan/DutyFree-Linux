@@ -136,6 +136,16 @@ static int write_traps(volatile char *p)
  * Returns the number of subtests reported (constant HUGE_CYCLE_TESTS).
  */
 #define HUGE_CYCLE_TESTS 6
+#define HUGE_TEST_PLAN (2 * HUGE_CYCLE_TESTS + 1)
+
+static void skip_all_hugetlb_tests(const char *reason)
+{
+	int i;
+
+	for (i = 0; i < HUGE_TEST_PLAN; i++)
+		ksft_test_result_skip("%s\n", reason);
+	ksft_finished();
+}
 
 static void huge_cycle(void *region, size_t size, unsigned int want_shift,
 		       const char *tag)
@@ -187,18 +197,18 @@ int main(void)
 	int ret;
 
 	ksft_print_header();
-	ksft_set_plan(2 * HUGE_CYCLE_TESTS + 1);
+	ksft_set_plan(HUGE_TEST_PLAN);
 
 	region = mmap(NULL, SIZE_2MB, PROT_READ | PROT_WRITE,
 		      MAP_PRIVATE | MAP_ANONYMOUS | MAP_POPULATE |
 		      MAP_HUGETLB | MAP_HUGE_2MB, -1, 0);
 	if (region == MAP_FAILED)
-		ksft_exit_skip("no 2MB hugepages available (echo N > /proc/sys/vm/nr_hugepages): %m\n");
+		skip_all_hugetlb_tests("no 2MB hugepages available; reserve nr_hugepages before running");
 
 	/* Probe kernel support before committing to the plan. */
 	ret = mprotect(region, SIZE_2MB, PROT_READ | PROT_STREAMING);
 	if (ret && errno == EINVAL)
-		ksft_exit_skip("PROT_STREAMING rejected (kernel without CONFIG_PAT_STREAMING?)\n");
+		skip_all_hugetlb_tests("PROT_STREAMING unsupported");
 	if (mprotect(region, SIZE_2MB, PROT_READ | PROT_WRITE))
 		ksft_exit_fail_msg("mprotect probe restore: %m\n");
 

@@ -84,6 +84,7 @@ TEST_GEN_FILES += streaming_basic
 TEST_GEN_FILES += streaming_reject
 TEST_GEN_FILES += streaming_hugetlb
 TEST_GEN_FILES += streaming_memfd
+TEST_GEN_FILES += streaming_lifecycle
 
 VMTARGETS := protection_keys
 BINARIES_32 := $(VMTARGETS:%=%_32)

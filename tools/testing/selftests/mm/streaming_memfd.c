@@ -2,13 +2,12 @@
 /*
  * mprotect(PROT_STREAMING) on a sealed memfd.
  *
- * A sealed memfd is the one MAP_SHARED file-backed carrier the entry check
- * admits. F_SEAL_WRITE supplies I1 at object scope: it cannot be applied
- * while a writable mapping exists, and none can be created afterwards, so
- * there is no dirty page-cache writeback for the Streaming cache-bit rewrite
- * to race against.
+ * A seal prevents writers but does not prevent a later read-only WB mmap.
+ * Without persistent object-wide epoch state, admitting even a currently
+ * single-mapped memfd would therefore leave an I0 race.  The VMA-local
+ * prototype rejects every memfd form until that state exists.
  *
- *   1. sealed memfd, single mapper          -> accepted
+ *   1. sealed memfd, single mapper          -> EINVAL
  *   2. unsealed shared memfd                -> EINVAL
  *   3. sealed memfd with a second mapping   -> EINVAL (I0: with several
  *      mappers a frame's type would have to be agreed across address
@@ -82,20 +81,15 @@ int main(void)
 	ksft_print_header();
 	ksft_set_plan(3);
 
-	/* 1. sealed, single mapper -> accepted */
+	/* 1. Even sealed/single-mapped is only a snapshot -> EINVAL. */
 	fd = make_memfd("streaming-sealed", 1);
 	first = mmap(NULL, REGION_SIZE, PROT_READ, MAP_SHARED, fd, 0);
 	if (first == MAP_FAILED)
 		ksft_exit_fail_msg("mmap sealed: %m\n");
 
 	ret = mprotect(first, REGION_SIZE, PROT_READ | PROT_STREAMING);
-	if (ret && errno == EINVAL)
-		ksft_exit_skip("sealed memfd rejected; kernel without CONFIG_PAT_STREAMING or without sealed-memfd support: %m\n");
-	ksft_test_result(ret == 0,
-			 "sealed memfd, single mapper -> accepted\n");
-
-	if (!ret && mprotect(first, REGION_SIZE, PROT_READ))
-		ksft_exit_fail_msg("revert to PROT_READ: %m\n");
+	ksft_test_result(ret == -1 && errno == EINVAL,
+			 "sealed memfd, single mapper -> EINVAL\n");
 	munmap(first, REGION_SIZE);
 	close(fd);
 
